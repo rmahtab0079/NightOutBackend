@@ -1,20 +1,20 @@
 from fastapi import FastAPI
 import random
 from pydantic import BaseModel
-application = FastAPI()
+app = FastAPI()
 
 class Suggestion(BaseModel):
     suggestion: str
 
-@application.get("/")
+@app.get("/")
 async def root():
     return {"message": "Hello World"}
 
-@application.get("/hello/{name}")
+@app.get("/hello/{name}")
 async def say_hello(name: str):
     return {"message": f"Hello {name}"}
 
-@application.get("/random", response_model=Suggestion)
+@app.get("/random", response_model=Suggestion)
 async def get_random_suggestion():
     print("This endpoint got called")
     random_suggestions = [

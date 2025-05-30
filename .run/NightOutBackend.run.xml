@@ -1,6 +1,6 @@
 <component name="ProjectRunConfigurationManager">
   <configuration default="false" name="NightOutBackend" type="Python.FastAPI">
-    <option name="file" value="$PROJECT_DIR$/main.py" />
+    <option name="file" value="$PROJECT_DIR$/application.py" />
     <module name="NightOutBackend" />
     <option name="ENV_FILES" value="" />
     <option name="INTERPRETER_OPTIONS" value="" />

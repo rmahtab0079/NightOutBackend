@@ -10,6 +10,8 @@ click==8.2.0
 colorama==0.4.6
 fastapi==0.115.12
 h11==0.16.0
+httpcore==1.0.9
+httpx==0.28.1
 idna==3.10
 jmespath==1.0.1
 packaging==24.2

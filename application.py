@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException
 import random
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 from dotenv import load_dotenv
 import requests
 app = FastAPI()
@@ -40,18 +40,18 @@ async def say_hello(name: str):
 @app.post("/random", response_model=Suggestion)
 async def get_random_suggestion(location: LocationData):
     print(f"Received location data: {location}")
-    search_nearby_places(location)
-    random_suggestions = [
-        "Take a walk at a Overpeck park",
-        "Go watch Bellarina at AMC Ridgefield Park",
-        "Go to the fair at the American Dream Mall",
-    ]
-
-    new_suggestion = random.choice(random_suggestions)
+    nearby_places = search_nearby_places(location)
+    # random_suggestions = [
+    #     "Take a walk at a Overpeck park",
+    #     "Go watch Bellarina at AMC Ridgefield Park",
+    #     "Go to the fair at the American Dream Mall",
+    # ]
+    #
+    new_suggestion = "Visit " + random.choice(nearby_places)
 
     return Suggestion(suggestion=new_suggestion)
 
-def search_nearby_places(location: LocationData):
+def search_nearby_places(location: LocationData) -> List[str]:
     endpoint_url = "https://places.googleapis.com/v1/places:searchNearby"
     headers = {
         "Content-Type": "application/json",
@@ -73,7 +73,13 @@ def search_nearby_places(location: LocationData):
 
     try:
         response = requests.post(endpoint_url, json=json_payload, headers=headers)
-        print(response.json())
+        response_dict = response.json()
+        places = response_dict["places"]
+        results = []
+        for place in places:
+            results.append(place['displayName']['text'])
+
+        return results
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

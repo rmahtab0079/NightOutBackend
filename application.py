@@ -120,7 +120,7 @@ async def submit_user_preferences(preferences: UserPreferences, authorization: O
 
     try:
         collection_ref = firebase_db.collection("user_preferences")
-        doc_ref = collection_ref.document(uid)  # Use UID as the document key
+        doc_ref = collection_ref.document(email_from_token)  # Use email as the document key
         doc_ref.set(payload)  # Overwrite on every call
         return {"message": "User preferences submitted", "documentId": doc_ref.id}
     except Exception as e:

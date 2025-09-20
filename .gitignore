@@ -109,3 +109,12 @@ cython_debug/
 
 # Jupyter Notebook checkpoints
 .ipynb_checkpoints/
+
+serviceAccount.json
+
+
+# datasets
+datasets/
+
+# csv
+*.csv

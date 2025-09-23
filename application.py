@@ -1,4 +1,5 @@
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Request
+from starlette.middleware.base import BaseHTTPMiddleware
 import random
 from pydantic import BaseModel
 from typing import Optional, List
@@ -15,6 +16,27 @@ from firebase_admin import auth as firebase_auth
 
 app = FastAPI()
 
+
+class SimpleLoggingMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        path = request.url.path
+        method = request.method
+        try:
+            response = await call_next(request)
+            try:
+                # Avoid reading body for large responses
+                body_preview = await response.body()
+            except Exception:
+                body_preview = b""
+            print(f"{method} {path} -> {response.status_code}")
+            return response
+        except Exception as e:
+            print(f"{method} {path} -> error: {e}")
+            raise
+
+
+app.add_middleware(SimpleLoggingMiddleware)
+
 # Load environment from mounted secret path if provided, else from local .env
 dotenv_path = os.getenv("DOTENV_PATH")
 if dotenv_path and os.path.exists(dotenv_path):
@@ -22,7 +44,7 @@ if dotenv_path and os.path.exists(dotenv_path):
 else:
     load_dotenv()
 
-from models.movies import get_movies_tmdb
+from models.movies import get_movies
 
 api_key = "AIzaSyDW0X1gO6uVSPkYIa3R6sjRwNQrz-afYU0"
 
@@ -51,6 +73,7 @@ class UserPreferences(BaseModel):
     email: Optional[str] = None
     age: Optional[int] = None
     movies: List[str] = []
+    movieIds: List[int] = []
     activities: List[str] = []
     cuisines: List[str] = []
     dietaryRestrictions: List[str] = []
@@ -114,9 +137,9 @@ def get_user_preferences():
             ),
         )
 
-@app.get("/tmdb")
+@app.get("/get_movies")
 def call_tmdb():
-    return get_movies_tmdb()
+    return get_movies()
 
 @app.post("/user_preferences")
 async def submit_user_preferences(preferences: UserPreferences, authorization: Optional[str] = Header(default=None)):
@@ -165,6 +188,17 @@ async def get_random_suggestion(location: LocationData):
     new_suggestion = "Visit " + random.choice(nearby_places)
 
     return Suggestion(suggestion=new_suggestion)
+
+
+@app.get("/random", response_model=Suggestion)
+async def get_random_suggestion_get(latitude: float, longitude: float):
+    location = LocationData(latitude=latitude, longitude=longitude)
+    print(f"Received location data (GET): {location}")
+    nearby_places = search_nearby_places(location)
+    print(nearby_places)
+    new_suggestion = "Visit " + random.choice(nearby_places)
+    return Suggestion(suggestion=new_suggestion)
+
 
 def search_nearby_places(location: LocationData) -> List[str]:
     endpoint_url = "https://places.googleapis.com/v1/places:searchNearby"

@@ -68,3 +68,6 @@ uritemplate==4.2.0
 urllib3==1.26.20
 uvicorn==0.34.2
 wcwidth==0.2.13
+
+# For Parquet read/write
+pyarrow==17.0.0

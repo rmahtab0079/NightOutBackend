@@ -62,3 +62,6 @@ secret-grant-access:
 	  --role=roles/secretmanager.secretAccessor \
 	  --quiet
 	@echo "Access granted. If deploy still fails, verify the service uses this SA."
+
+ngrok:
+	ngrok http http://localhost:8000

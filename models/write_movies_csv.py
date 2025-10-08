@@ -141,5 +141,17 @@ def get_tv_genres():
     return genre_map
 
 
+def movies_dataframe():
+    """
+    This function reads the Parquet File and returns a Pandas DataFrame.
+    :return:
+    """
+    file_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "datasets", "movies_dataset.parquet")
+    df = pd.read_parquet(file_path, engine="pyarrow")
+    print(df.head(10))
+
+def get_movies_
+
+
 if __name__ == "__main__":
-    write_tv_df()
+    movies_dataframe()

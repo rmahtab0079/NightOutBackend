@@ -23,7 +23,7 @@ def write_tv_df():
 
     # Use a thread pool with a max of 10 concurrent workers
     with ThreadPoolExecutor(max_workers=10) as executor:
-        for i in range(1, 10000):
+        for i in range(1, 1000):
             executor.submit(get_movies_page, tmdb_api_key, i, results_queue)
 
     responses = []
@@ -75,7 +75,7 @@ def read_movies_df():
 
 def get_tv_page(api_key, page, results_queue):
     # Small delay to avoid hitting API rate limits
-    time.sleep(0.4)
+    time.sleep(1)
     url = f"https://api.themoviedb.org/3/tv/top_rated?language=en-US&page={page}&api_key={api_key}"
     #url = f"https://api.themoviedb.org/3/discover/movie?include_adult=false&include_video=false&language=en-US&page=1&sort_by=popularity.desc&api_key={tmdb_api_key}"
     response = requests.get(url)
@@ -96,7 +96,7 @@ def get_tv_page(api_key, page, results_queue):
 
 def get_movies_page(api_key, page, results_queue):
     # Small delay to avoid hitting API rate limits
-    time.sleep(0.4)
+    time.sleep(1)
     url = f"https://api.themoviedb.org/3/movie/top_rated?language=en-US&page={page}&api_key={api_key}"
     #url = f"https://api.themoviedb.org/3/discover/movie?include_adult=false&include_video=false&language=en-US&page=1&sort_by=popularity.desc&api_key={tmdb_api_key}"
     response = requests.get(url)
@@ -110,6 +110,7 @@ def get_movies_page(api_key, page, results_queue):
                 movie["poster_url"] = f"{BASE_IMAGE_URL}{DEFAULT_IMAGE_SIZE}{backdrop_path}"
         # Add the modified response to the queue
         results_queue.put(data)
+        print("Successfully fetched a movie page")
 
     else:
         print(f"Request failed with status code {response.status_code}")
@@ -150,8 +151,6 @@ def movies_dataframe():
     df = pd.read_parquet(file_path, engine="pyarrow")
     print(df.head(10))
 
-def get_movies_
-
 
 if __name__ == "__main__":
-    movies_dataframe()
+    write_movies_df()

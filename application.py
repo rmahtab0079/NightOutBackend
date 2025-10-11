@@ -118,6 +118,7 @@ def _verify_and_get_user(authorization: Optional[str]) -> dict:
         raise HTTPException(status_code=401, detail=f"Invalid ID token: {e}")
 
 
+
 @app.get("/")
 async def root():
     return {"message": "Hello World"}
@@ -126,7 +127,8 @@ async def root():
 async def say_hello(name: str):
     return {"message": f"Hello {name}"}
 
-def get_user_preferences():
+@app.get("/get_user_preferences")
+async def get_user_preferences(authorization: Optional[str] = Header(default=None)):
     initialize_firebase_if_needed()
     if firebase_db is None:
         raise HTTPException(
@@ -140,6 +142,41 @@ def get_user_preferences():
 @app.get("/get_movies")
 def call_tmdb():
     return get_movies()
+
+
+@app.get("/get_user_preferences")
+async def get_user_preferences(authorization: Optional[str] = Header(default=None)):
+    initialize_firebase_if_needed()
+    if firebase_db is None:
+        raise HTTPException(
+            status_code=501,
+            detail=(
+                "Firebase not configured. Set FIREBASE_SERVICE_ACCOUNT_PATH and "
+                "FIREBASE_PROJECT_ID environment variables to enable writes."
+            ),
+        )
+
+    # Verify user and get email from token
+    decoded = _verify_and_get_user(authorization)
+    email_from_token = decoded.get("email")
+
+    if not email_from_token:
+        raise HTTPException(status_code=400, detail="Email not found in token")
+
+    try:
+        collection_ref = firebase_db.collection("user_preferences")
+        doc_ref = collection_ref.document(email_from_token)  # Use email as the document key
+        doc = doc_ref.get()
+
+        if doc.exists:
+            return doc.to_dict()
+        else:
+            raise HTTPException(status_code=404, detail="User preferences not found")
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(e)
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/user_preferences")
 async def submit_user_preferences(preferences: UserPreferences, authorization: Optional[str] = Header(default=None)):

@@ -1,8 +1,89 @@
 import os
+import json
+import requests
+
 import pandas as pd
 from scipy.spatial.distance import pdist, squareform
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+
+# Firebase Admin SDK imports for Storage access
+import firebase_admin
+from firebase_admin import credentials
+from firebase_admin import storage
+
+
+tmdb_api_key = os.getenv("TMDB_API_KEY")
+
+# Force bucket name as requested; can still be overridden by FIREBASE_STORAGE_BUCKET
+DEFAULT_STORAGE_BUCKET = "nightoutclient-7931e.firebasestorage.app"
+
+
+def _load_service_account_project_id(path: str | None) -> str | None:
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data.get("project_id")
+    except Exception:
+        return None
+
+
+def _infer_bucket_name() -> str:
+    # Use explicit env if provided; otherwise use the fixed bucket name
+    return os.getenv("FIREBASE_STORAGE_BUCKET", DEFAULT_STORAGE_BUCKET)
+
+
+def _initialize_firebase_if_needed() -> None:
+    if firebase_admin._apps:  # type: ignore[attr-defined]
+        return
+    service_account_path = os.getenv("FIREBASE_SERVICE_ACCOUNT_PATH")
+    # Prefer explicit FIREBASE_PROJECT_ID, else fall back to GOOGLE_CLOUD_PROJECT (ADC) or SA json
+    project_id = os.getenv("FIREBASE_PROJECT_ID") or os.getenv("GOOGLE_CLOUD_PROJECT") or _load_service_account_project_id(service_account_path)
+    storage_bucket = os.getenv("FIREBASE_STORAGE_BUCKET", DEFAULT_STORAGE_BUCKET)
+
+    options: dict[str, str] = {}
+    if project_id:
+        options["projectId"] = project_id
+    if storage_bucket:
+        options["storageBucket"] = storage_bucket
+
+    if service_account_path and os.path.exists(service_account_path):
+        cred = credentials.Certificate(service_account_path)
+        firebase_admin.initialize_app(cred, options or None)
+    else:
+        # Application Default Credentials (Cloud Run recommended)
+        firebase_admin.initialize_app(options=options or None)
+
+
+def get_movies_df_from_storage(blob_path: str = "movies_dataset.parquet") -> pd.DataFrame:
+    # Ensure Firebase is initialized so storage has project/bucket context
+    _initialize_firebase_if_needed()
+    # Use the fixed bucket name (or env override)
+    bucket_name = _infer_bucket_name()
+    bucket = storage.bucket(bucket_name)
+    blob = bucket.blob(blob_path)
+
+    if not blob.exists():
+        raise FileNotFoundError(f"Blob not found in bucket '{bucket.name}': {blob_path}")
+
+    # Download to a temporary file and load with pandas
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".parquet") as tmp_file:
+        temp_path = tmp_file.name
+    try:
+        blob.download_to_filename(temp_path)
+        movie_df = pd.read_parquet(temp_path, engine="pyarrow")
+        movie_df = movie_df.drop_duplicates(subset="original_title", keep="first")
+        return movie_df
+    finally:
+        try:
+            os.remove(temp_path)
+        except Exception:
+            pass
+
 
 def get_movies_df() -> pd.DataFrame:
     file_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "datasets", "movies_dataset.parquet")
@@ -12,7 +93,8 @@ def get_movies_df() -> pd.DataFrame:
 
     return movie_df
 
-def genre_similarity(movies: set[str]) -> pd.DataFrame:
+
+def genre_similarity(movies: set[int]) -> pd.DataFrame:
     """
     This function reads the Parquet File, processes genre_ids, and returns a DataFrame with crosstab operation.
     """
@@ -25,7 +107,7 @@ def genre_similarity(movies: set[str]) -> pd.DataFrame:
     movie_genre_df['genre_ids'] = movie_genre_df['genre_ids'].astype(float)
 
     # Create cross-tabulation between original_title and genre_ids
-    movie_cross_table = pd.crosstab(movie_genre_df['original_title'], movie_genre_df['genre_ids'])
+    movie_cross_table = pd.crosstab(movie_genre_df['id'], movie_genre_df['genre_ids'])
 
     # Select rows for movies
 
@@ -46,7 +128,8 @@ def genre_similarity(movies: set[str]) -> pd.DataFrame:
 
     return sorted_movie_df
 
-def overview_similarity(movies: set[str]) -> pd.DataFrame:
+
+def overview_similarity(movies: set[int]) -> pd.DataFrame:
     # Create vectorized data from the number of word occurences
     movies_df = get_movies_df()
     vectorizer = TfidfVectorizer(min_df=2, max_df=0.7)
@@ -54,7 +137,7 @@ def overview_similarity(movies: set[str]) -> pd.DataFrame:
 
     movies_overview_df = pd.DataFrame(vectorized_data.toarray(), columns=vectorizer.get_feature_names_out())
 
-    movies_overview_df.index = movies_df['original_title']
+    movies_overview_df.index = movies_df['id']
 
     # Calculate the cosine similarity
     cosine_similarity_array = cosine_similarity(movies_overview_df)
@@ -76,9 +159,21 @@ def overview_similarity(movies: set[str]) -> pd.DataFrame:
     return ordered_similarities
 
 
-def find_similar_movie(movies: set[str]):
-    movies_df = get_movies_df()
-    movies_df.set_index('original_title', inplace=True)
+def get_movie_detail(movie_id: int):
+    url = f"https://api.themoviedb.org/3/movie/{movie_id}?language=en-US&api_key={tmdb_api_key}"
+    #url = f"https://api.themoviedb.org/3/discover/movie?include_adult=false&include_video=false&language=en-US&page=1&sort_by=popularity.desc&api_key={tmdb_api_key}"
+    response = requests.get(url)
+    if response.status_code == 200:
+        # Parse JSON response
+        data = response.json()
+        return data
+    else:
+        print(f"Request failed with status code {response.json()}")
+
+
+def find_similar_movie(movies: set[int]):
+    movies_df = get_movies_df_from_storage()
+    movies_df.set_index('id', inplace=True)
     genre_similarity_df = genre_similarity(movies)
     overview_similarity_df = overview_similarity(movies)
 
@@ -96,27 +191,35 @@ def find_similar_movie(movies: set[str]):
     combined_df = combined_df.sort_values('combined_score', ascending=False)
 
     # Find first non-sequel/prequel movie
-    for curr_movie_title in combined_df.index:
+    for curr_movie_id in combined_df.index:
         # Skip if it's one of the input movies
-        if curr_movie_title in movies:
+        if curr_movie_id in movies:
             continue
 
-        if movies_df.loc[curr_movie_title, 'original_language'] != "en":
+        if movies_df.loc[curr_movie_id, 'original_language'] != "en":
             continue
 
         # Check if it's a sequel/prequel of any of the input movies
+        curr_movie_title = movies_df.loc[curr_movie_id, 'original_title']
+
         is_related = False
         for input_movie in movies:
-            if is_sequel_or_prequel(input_movie, curr_movie_title):
+            movie_title = movies_df.loc[input_movie, 'original_title']
+
+            if movie_title and is_sequel_or_prequel(movie_title, curr_movie_title):
                 is_related = True
                 break
 
         if not is_related:
             print(f"Found similar movie: {curr_movie_title}")
-            print(f"Genre similarity: {combined_df.loc[curr_movie_title, 'genre_sim']:.3f}")
-            print(f"Overview similarity: {combined_df.loc[curr_movie_title, 'overview_sim']:.3f}")
-            print(f"Combined score: {combined_df.loc[curr_movie_title, 'combined_score']:.3f}")
-            return curr_movie_title
+            print(f"Genre similarity: {combined_df.loc[curr_movie_id, 'genre_sim']:.3f}")
+            print(f"Overview similarity: {combined_df.loc[curr_movie_id, 'overview_sim']:.3f}")
+            print(f"Combined score: {combined_df.loc[curr_movie_id, 'combined_score']:.3f}")
+
+            movie_detail = get_movie_detail(curr_movie_id)
+            print(movie_detail)
+
+            return movie_detail
 
     return None
 
@@ -150,5 +253,5 @@ def is_sequel_or_prequel(original_movie: str, candidate_movie: str) -> bool:
 
 
 if __name__ == "__main__":
-    movies = set(["The Godfather", "The Matrix", "The Dark Knight", "Oppenheimer", "Dune"])
+    movies = set([278, 238, 240, 424])
     find_similar_movie(movies)

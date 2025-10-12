@@ -25,7 +25,6 @@ from queue import Queue
 BASE_IMAGE_URL = "https://image.tmdb.org/t/p/"
 DEFAULT_IMAGE_SIZE = "w200"  # Customize based on required size (e.g., "original", "w300", etc.)
 
-
 def get_movies():
     tmdb_api_key = os.getenv("TMDB_API_KEY")
     results_queue = Queue()
@@ -42,6 +41,8 @@ def get_movies():
     responses = []
     while not results_queue.empty():
         responses.append(results_queue.get())
+
+    responses.sort(key=lambda x: x["page"])
 
     # Flatten pages and build a TMDB-like envelope expected by the client
     page = 1
@@ -66,12 +67,16 @@ def get_movies_page(api_key, page, results_queue):
     if response.status_code == 200:
         # Parse JSON response
         data = response.json()
+        movies = []
         for movie in data.get("results", []):
             backdrop_path = movie.get("poster_path")
             if backdrop_path:
                 # Construct the full backdrop image URL
                 movie["poster_url"] = f"{BASE_IMAGE_URL}{DEFAULT_IMAGE_SIZE}{backdrop_path}"
+            if movie["original_language"] == "en":
+                movies.append(movie)
         # Add the modified response to the queue
+        data["results"] = movies
         results_queue.put(data)
 
     else:

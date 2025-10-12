@@ -5,6 +5,7 @@ from pydantic import BaseModel
 from typing import Optional, List
 from dotenv import load_dotenv
 import requests
+import json
 import os
 from datetime import datetime
 
@@ -45,6 +46,7 @@ else:
     load_dotenv()
 
 from models.movies import get_movies
+from models.process_movies import find_similar_movie
 
 api_key = "AIzaSyDW0X1gO6uVSPkYIa3R6sjRwNQrz-afYU0"
 
@@ -107,6 +109,39 @@ def initialize_firebase_if_needed() -> None:
         firebase_db = None
 
 
+def _load_service_account_project_id(path: str | None) -> str | None:
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data.get("project_id")
+    except Exception:
+        return None
+
+
+def _infer_bucket_name() -> str | None:
+    # Priority: explicit env -> derive from FIREBASE_PROJECT_ID/GOOGLE_CLOUD_PROJECT -> derive from serviceAccount.json
+    explicit = os.getenv("FIREBASE_STORAGE_BUCKET")
+    if explicit:
+        return explicit
+
+    project_id = os.getenv("FIREBASE_PROJECT_ID") or os.getenv("GOOGLE_CLOUD_PROJECT")
+    if not project_id:
+        project_id = _load_service_account_project_id(os.getenv("FIREBASE_SERVICE_ACCOUNT_PATH"))
+
+    if not project_id:
+        return None
+
+    # Try common default bucket domain patterns
+    candidates = [
+        f"{project_id}.appspot.com",
+        f"{project_id}.firebasestorage.app",
+    ]
+    # Return first candidate; existence is checked later
+    return candidates[0]
+
+
 def _verify_and_get_user(authorization: Optional[str]) -> dict:
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
@@ -118,7 +153,6 @@ def _verify_and_get_user(authorization: Optional[str]) -> dict:
         raise HTTPException(status_code=401, detail=f"Invalid ID token: {e}")
 
 
-
 @app.get("/")
 async def root():
     return {"message": "Hello World"}
@@ -127,21 +161,18 @@ async def root():
 async def say_hello(name: str):
     return {"message": f"Hello {name}"}
 
-@app.get("/get_user_preferences")
-async def get_user_preferences(authorization: Optional[str] = Header(default=None)):
-    initialize_firebase_if_needed()
-    if firebase_db is None:
-        raise HTTPException(
-            status_code=501,
-            detail=(
-                "Firebase not configured. Set FIREBASE_SERVICE_ACCOUNT_PATH and "
-                "FIREBASE_PROJECT_ID environment variables to enable writes."
-            ),
-        )
+@app.get("/find_similar_movie")
+def find_similar_movie_from_storage():
+    movies = set([278, 238, 240, 424])
+    similar_movie = find_similar_movie(movies)
+    return similar_movie
+
 
 @app.get("/get_movies")
 def call_tmdb():
     return get_movies()
+
+
 
 
 @app.get("/get_user_preferences")
@@ -210,6 +241,15 @@ async def submit_user_preferences(preferences: UserPreferences, authorization: O
         print(e)
         raise HTTPException(status_code=500, detail=str(e))
 
+
+@app.get("/get_movie_suggestion")
+async def get_recommended_movie(authorization: Optional[str] = Header(default=None)):
+    user_preferences = await get_user_preferences(authorization)
+    movie_ids = user_preferences["movieIds"]
+    movie_id_set = set(movie_ids)
+    similar_movie = find_similar_movie(movie_id_set)
+
+    return similar_movie
 
 @app.post("/random", response_model=Suggestion)
 async def get_random_suggestion(location: LocationData):

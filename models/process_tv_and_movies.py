@@ -17,6 +17,8 @@ tmdb_api_key = os.getenv("TMDB_API_KEY")
 
 # Force bucket name as requested; can still be overridden by FIREBASE_STORAGE_BUCKET
 DEFAULT_STORAGE_BUCKET = "nightoutclient-7931e.firebasestorage.app"
+movies_path = "movies_dataset.parquet"
+tv_path = "tv_dataset.parquet"
 
 
 def _load_service_account_project_id(path: str | None) -> str | None:
@@ -57,13 +59,18 @@ def _initialize_firebase_if_needed() -> None:
         firebase_admin.initialize_app(options=options or None)
 
 
-def get_movies_df_from_storage(blob_path: str = "movies_dataset.parquet") -> pd.DataFrame:
+def get_asset_df_from_storage(blob_path: str, asset_type: str) -> pd.DataFrame:
     # Ensure Firebase is initialized so storage has project/bucket context
     _initialize_firebase_if_needed()
     # Use the fixed bucket name (or env override)
     bucket_name = _infer_bucket_name()
     bucket = storage.bucket(bucket_name)
     blob = bucket.blob(blob_path)
+
+    if asset_type == 'movies':
+        title = "original_title"
+    else:
+        title = "original_name"
 
     if not blob.exists():
         raise FileNotFoundError(f"Blob not found in bucket '{bucket.name}': {blob_path}")
@@ -76,7 +83,7 @@ def get_movies_df_from_storage(blob_path: str = "movies_dataset.parquet") -> pd.
     try:
         blob.download_to_filename(temp_path)
         movie_df = pd.read_parquet(temp_path, engine="pyarrow")
-        movie_df = movie_df.drop_duplicates(subset="original_title", keep="first")
+        movie_df = movie_df.drop_duplicates(subset=title, keep="first")
         return movie_df
     finally:
         try:
@@ -85,20 +92,24 @@ def get_movies_df_from_storage(blob_path: str = "movies_dataset.parquet") -> pd.
             pass
 
 
-def get_movies_df() -> pd.DataFrame:
-    file_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "datasets", "movies_dataset.parquet")
-    movie_df = pd.read_parquet(file_path, engine="pyarrow")
+def get_asset_df(asset_type : str) -> pd.DataFrame:
+    if asset_type == 'movies':
+        file_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "datasets", "movies_dataset.parquet")
+        title = "original_title"
+    else:
+        file_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "datasets", "tv_dataset.parquet")
+        title = "original_name"
+    asset_df = pd.read_parquet(file_path, engine="pyarrow")
+    asset_df = asset_df.drop_duplicates(subset=title, keep='first')
 
-    movie_df = movie_df.drop_duplicates(subset='original_title', keep='first')
-
-    return movie_df
+    return asset_df
 
 
-def genre_similarity(movies: set[int]) -> pd.DataFrame:
+def genre_similarity(movies: set[int], asset_type: str) -> pd.DataFrame:
     """
     This function reads the Parquet File, processes genre_ids, and returns a DataFrame with crosstab operation.
     """
-    movie_genre_df = get_movies_df()
+    movie_genre_df = get_asset_df(asset_type)
 
     # Explode the 'genre_ids' column to split lists into individual rows
     movie_genre_df = movie_genre_df.explode('genre_ids')
@@ -129,9 +140,9 @@ def genre_similarity(movies: set[int]) -> pd.DataFrame:
     return sorted_movie_df
 
 
-def overview_similarity(movies: set[int]) -> pd.DataFrame:
+def overview_similarity(movies: set[int], asset_type) -> pd.DataFrame:
     # Create vectorized data from the number of word occurences
-    movies_df = get_movies_df()
+    movies_df = get_asset_df(asset_type)
     vectorizer = TfidfVectorizer(min_df=2, max_df=0.7)
     vectorized_data = vectorizer.fit_transform(movies_df['overview'])
 
@@ -159,9 +170,9 @@ def overview_similarity(movies: set[int]) -> pd.DataFrame:
     return ordered_similarities
 
 
-def get_movie_detail(movie_id: int):
-    url = f"https://api.themoviedb.org/3/movie/{movie_id}?language=en-US&api_key={tmdb_api_key}"
-    #url = f"https://api.themoviedb.org/3/discover/movie?include_adult=false&include_video=false&language=en-US&page=1&sort_by=popularity.desc&api_key={tmdb_api_key}"
+def get_movie_detail(movie_id: int, asset_type: str):
+    url = f"https://api.themoviedb.org/3/{asset_type}/{movie_id}?language=en-US&api_key={tmdb_api_key}"
+    #url = f"https://api.themoviedb.org/3/{asset_type}/{movie_id}?language=en-US&api_key=2ed2b9d2e44bf6e9a70b687c134ed8f9"
     response = requests.get(url)
     if response.status_code == 200:
         # Parse JSON response
@@ -171,11 +182,16 @@ def get_movie_detail(movie_id: int):
         print(f"Request failed with status code {response.json()}")
 
 
-def find_similar_movie(movies: set[int]):
-    movies_df = get_movies_df_from_storage()
-    movies_df.set_index('id', inplace=True)
-    genre_similarity_df = genre_similarity(movies)
-    overview_similarity_df = overview_similarity(movies)
+def find_similar_asset(assets: set[int], asset_type: str):
+    if asset_type == 'movies':
+        asset_df =  get_asset_df_from_storage(movies_path, asset_type)
+        title = "original_title"
+    else:
+        asset_df = get_asset_df_from_storage(tv_path, asset_type)
+        title = "original_name"
+    asset_df.set_index('id', inplace=True)
+    genre_similarity_df = genre_similarity(assets, asset_type)
+    overview_similarity_df = overview_similarity(assets, asset_type)
 
     # Combine both similarities into one DataFrame
     combined_df = pd.DataFrame({
@@ -191,35 +207,36 @@ def find_similar_movie(movies: set[int]):
     combined_df = combined_df.sort_values('combined_score', ascending=False)
 
     # Find first non-sequel/prequel movie
-    for curr_movie_id in combined_df.index:
+    for curr_asset_id in combined_df.index:
         # Skip if it's one of the input movies
-        if curr_movie_id in movies:
+        if curr_asset_id in assets:
             continue
 
-        if movies_df.loc[curr_movie_id, 'original_language'] != "en":
+        if asset_df.loc[curr_asset_id, 'original_language'] != "en":
             continue
 
         # Check if it's a sequel/prequel of any of the input movies
-        curr_movie_title = movies_df.loc[curr_movie_id, 'original_title']
+        curr_asset_title = asset_df.loc[curr_asset_id, title]
 
         is_related = False
-        for input_movie in movies:
-            movie_title = movies_df.loc[input_movie, 'original_title']
+        for input_asset in assets:
+            asset_title = asset_df.loc[input_asset, title]
 
-            if movie_title and is_sequel_or_prequel(movie_title, curr_movie_title):
+            if asset_title and is_sequel_or_prequel(asset_title, curr_asset_title):
                 is_related = True
                 break
 
         if not is_related:
-            print(f"Found similar movie: {curr_movie_title}")
-            print(f"Genre similarity: {combined_df.loc[curr_movie_id, 'genre_sim']:.3f}")
-            print(f"Overview similarity: {combined_df.loc[curr_movie_id, 'overview_sim']:.3f}")
-            print(f"Combined score: {combined_df.loc[curr_movie_id, 'combined_score']:.3f}")
+            print(f"Found similar movie series ID: {curr_asset_id}")
+            print(f"Found similar movie: {curr_asset_title}")
+            print(f"Genre similarity: {combined_df.loc[curr_asset_id, 'genre_sim']:.3f}")
+            print(f"Overview similarity: {combined_df.loc[curr_asset_id, 'overview_sim']:.3f}")
+            print(f"Combined score: {combined_df.loc[curr_asset_id, 'combined_score']:.3f}")
 
-            movie_detail = get_movie_detail(curr_movie_id)
-            print(movie_detail)
+            asset_detail = get_movie_detail(curr_asset_id, asset_type)
+            print(asset_detail)
 
-            return movie_detail
+            return asset_detail
 
     return None
 
@@ -253,5 +270,7 @@ def is_sequel_or_prequel(original_movie: str, candidate_movie: str) -> bool:
 
 
 if __name__ == "__main__":
-    movies = set([278, 238, 240, 424])
-    find_similar_movie(movies)
+    #movies = {278, 238, 240, 424}
+    shows = {94605, 1396, 246, 85077, 60625}
+    find_similar_asset(shows, "tv")
+

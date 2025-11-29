@@ -46,7 +46,8 @@ else:
     load_dotenv()
 
 from models.movies import get_movies
-from models.process_movies import find_similar_movie
+from models.tv import get_tv
+from models.process_tv_and_movies import find_similar_asset
 
 api_key = "AIzaSyDW0X1gO6uVSPkYIa3R6sjRwNQrz-afYU0"
 
@@ -74,12 +75,11 @@ class UserPreferences(BaseModel):
     uid: Optional[str] = None
     email: Optional[str] = None
     age: Optional[int] = None
-    movies: List[str] = []
     movieIds: List[int] = []
+    tvShowIds: List[int] = []
     activities: List[str] = []
     cuisines: List[str] = []
     dietaryRestrictions: List[str] = []
-    drinksAlcohol: Optional[bool] = None
 
 
 # Initialize Firebase Admin (with placeholders)
@@ -163,16 +163,18 @@ async def say_hello(name: str):
 
 @app.get("/find_similar_movie")
 def find_similar_movie_from_storage():
-    movies = set([278, 238, 240, 424])
-    similar_movie = find_similar_movie(movies)
+    movies = {278, 238, 240, 424}
+    similar_movie = find_similar_asset(movies, "movie")
     return similar_movie
 
 
-@app.get("/get_movies")
-def call_tmdb():
+@app.get("/movies")
+def movies():
     return get_movies()
 
-
+@app.get("/tv")
+def tv():
+    return get_tv()
 
 
 @app.get("/get_user_preferences")
@@ -247,7 +249,16 @@ async def get_recommended_movie(authorization: Optional[str] = Header(default=No
     user_preferences = await get_user_preferences(authorization)
     movie_ids = user_preferences["movieIds"]
     movie_id_set = set(movie_ids)
-    similar_movie = find_similar_movie(movie_id_set)
+    similar_movie = find_similar_asset(movie_id_set, "movie")
+
+    return similar_movie
+
+@app.get("/get_tv_suggestion")
+async def get_recommended_tv(authorization: Optional[str] = Header(default=None)):
+    user_preferences = await get_user_preferences(authorization)
+    tv_ids = user_preferences["tvShowIds"]
+    tv_id_set = set(tv_ids)
+    similar_movie = find_similar_asset(tv_id_set, "tv")
 
     return similar_movie
 

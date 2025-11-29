@@ -44,6 +44,9 @@ cloud-run-update-dotenv:
 		--allow-unauthenticated \
 		--set-secrets=$(DOTENV_MOUNT_PATH)=$(DOTENV_SECRET):latest \
 		--update-env-vars DOTENV_PATH=$(DOTENV_MOUNT_PATH) \
+		--cpu 8 \
+		--memory 32Gi \
+		--max-instances 5 \
 		--quiet
 	@echo "Deployment complete."
 

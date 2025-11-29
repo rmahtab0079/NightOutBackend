@@ -24,7 +24,7 @@ def write_tv_df():
     # Use a thread pool with a max of 10 concurrent workers
     with ThreadPoolExecutor(max_workers=10) as executor:
         for i in range(1, 1000):
-            executor.submit(get_movies_page, tmdb_api_key, i, results_queue)
+            executor.submit(get_movies_page, tmdb_api_key, i, results_queue, "tv")
 
     responses = []
     while not results_queue.empty():
@@ -49,7 +49,7 @@ def write_movies_df():
     # Use a thread pool with a max of 10 concurrent workers
     with ThreadPoolExecutor(max_workers=10) as executor:
         for i in range(1, 10000):
-            executor.submit(get_movies_page, tmdb_api_key, i, results_queue)
+            executor.submit(get_movies_page, tmdb_api_key, i, results_queue, "movie")
 
     responses = []
     while not results_queue.empty():
@@ -94,10 +94,10 @@ def get_tv_page(api_key, page, results_queue):
         print(f"Request failed with status code {response.status_code}")
 
 
-def get_movies_page(api_key, page, results_queue):
+def get_movies_page(api_key, page, results_queue, asset_type: str):
     # Small delay to avoid hitting API rate limits
     time.sleep(1)
-    url = f"https://api.themoviedb.org/3/movie/top_rated?language=en-US&page={page}&api_key={api_key}"
+    url = f"https://api.themoviedb.org/3/{asset_type}/top_rated?language=en-US&page={page}&api_key={api_key}"
     #url = f"https://api.themoviedb.org/3/discover/movie?include_adult=false&include_video=false&language=en-US&page=1&sort_by=popularity.desc&api_key={tmdb_api_key}"
     response = requests.get(url)
     if response.status_code == 200:
@@ -114,6 +114,7 @@ def get_movies_page(api_key, page, results_queue):
 
     else:
         print(f"Request failed with status code {response.status_code}")
+        print(f"Request respnse: {response.json()}")
 
 
 def get_movie_genres():
@@ -153,4 +154,4 @@ def movies_dataframe():
 
 
 if __name__ == "__main__":
-    write_movies_df()
+    write_tv_df()

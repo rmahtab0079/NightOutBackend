@@ -55,6 +55,9 @@ places_of_interest = ["hiking_area", "restaurant", "bar", "cafe", "coffee_shop",
                       "historical_landmark", "movie_theater", "video_arcade", "karaoke", "night_club", "opera_house",
                       "dance_hall", "amusement_park"]
 
+movie_type = "movie"
+tv_type = "tv"
+
 # Model for location data
 class LocationData(BaseModel):
     latitude: float
@@ -80,6 +83,11 @@ class UserPreferences(BaseModel):
     activities: List[str] = []
     cuisines: List[str] = []
     dietaryRestrictions: List[str] = []
+
+class UpdatePreferenceRequest(BaseModel):
+    key: str  # Firestore document key (email)
+    kind: str  # 'movies' or 'tv'
+    itemId: int  # ID to add
 
 
 # Initialize Firebase Admin (with placeholders)
@@ -205,6 +213,50 @@ async def get_user_preferences(authorization: Optional[str] = Header(default=Non
             return doc.to_dict()
         else:
             raise HTTPException(status_code=404, detail="User preferences not found")
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/user_preferences/update")
+async def update_user_preferences(payload: UpdatePreferenceRequest, authorization: Optional[str] = Header(default=None)):
+    initialize_firebase_if_needed()
+    if firebase_db is None:
+        raise HTTPException(
+            status_code=501,
+            detail=(
+                "Firebase not configured. Set FIREBASE_SERVICE_ACCOUNT_PATH and "
+                "FIREBASE_PROJECT_ID environment variables to enable writes."
+            ),
+        )
+
+    # Verify user; enforce that caller matches the document key
+    decoded = _verify_and_get_user(authorization)
+    email_from_token = decoded.get("email")
+    if not email_from_token:
+        raise HTTPException(status_code=400, detail="Email not found in token")
+    if email_from_token != payload.key:
+        raise HTTPException(status_code=403, detail="Not authorized to modify this user preferences")
+
+    field_name = None
+    if payload.kind.lower() == "movies":
+        field_name = "movieIds"
+    elif payload.kind.lower() == "tv":
+        field_name = "tvShowIds"
+    else:
+        raise HTTPException(status_code=400, detail="Invalid kind. Use 'movies' or 'tv'.")
+
+    try:
+        collection_ref = firebase_db.collection("user_preferences")
+        doc_ref = collection_ref.document(payload.key)
+        doc = doc_ref.get()
+        if not doc.exists:
+            raise HTTPException(status_code=404, detail="User preferences document not found")
+
+        # Use Firestore ArrayUnion to add if not present
+        doc_ref.update({field_name: firestore.ArrayUnion([payload.itemId])})
+        return {"message": "User preferences updated", "field": field_name, "id": payload.itemId}
     except HTTPException:
         raise
     except Exception as e:

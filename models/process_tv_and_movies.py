@@ -67,7 +67,7 @@ def get_asset_df_from_storage(blob_path: str, asset_type: str) -> pd.DataFrame:
     bucket = storage.bucket(bucket_name)
     blob = bucket.blob(blob_path)
 
-    if asset_type == 'movies':
+    if asset_type == 'movie':
         title = "original_title"
     else:
         title = "original_name"
@@ -183,7 +183,7 @@ def get_movie_detail(movie_id: int, asset_type: str):
 
 
 def find_similar_asset(assets: set[int], asset_type: str):
-    if asset_type == 'movies':
+    if asset_type == 'movie':
         asset_df =  get_asset_df_from_storage(movies_path, asset_type)
         title = "original_title"
     else:
@@ -212,19 +212,25 @@ def find_similar_asset(assets: set[int], asset_type: str):
         if curr_asset_id in assets:
             continue
 
-        if asset_df.loc[curr_asset_id, 'original_language'] != "en":
+        # Ensure the candidate exists in the DataFrame and language column is present
+        if curr_asset_id not in asset_df.index:
             continue
+        if 'original_language' in asset_df.columns:
+            if asset_df.at[curr_asset_id, 'original_language'] != "en":
+                continue
 
         # Check if it's a sequel/prequel of any of the input movies
         curr_asset_title = asset_df.loc[curr_asset_id, title]
 
         is_related = False
         for input_asset in assets:
-            asset_title = asset_df.loc[input_asset, title]
-
-            if asset_title and is_sequel_or_prequel(asset_title, curr_asset_title):
-                is_related = True
-                break
+            # ensure both index and column exist before accessing
+            if input_asset in asset_df.index and title in asset_df.columns:
+                asset_title = asset_df.at[input_asset, title]
+                if asset_title and str(asset_title).strip():
+                    if is_sequel_or_prequel(str(asset_title), curr_asset_title):
+                        is_related = True
+                        break
 
         if not is_related:
             print(f"Found similar movie series ID: {curr_asset_id}")

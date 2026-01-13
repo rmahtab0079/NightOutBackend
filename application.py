@@ -48,6 +48,7 @@ else:
 from models.movies import get_movies
 from models.tv import get_tv
 from models.process_tv_and_movies import find_similar_asset
+from models.write_movies_csv import get_movie_genres, get_tv_genres
 
 api_key = "AIzaSyDW0X1gO6uVSPkYIa3R6sjRwNQrz-afYU0"
 
@@ -80,9 +81,12 @@ class UserPreferences(BaseModel):
     age: Optional[int] = None
     movieIds: List[int] = []
     tvShowIds: List[int] = []
-    activities: List[str] = []
-    cuisines: List[str] = []
-    dietaryRestrictions: List[str] = []
+    streamingServices: List[str] = []
+
+class SearchAssetParams(BaseModel):
+    start_year: int = 1970
+    end_year: int = 2026
+    genres: List[int] = []  # Genre IDs to filter by (empty = all genres)
 
 class UpdatePreferenceRequest(BaseModel):
     key: str  # Firestore document key (email)
@@ -176,13 +180,15 @@ def find_similar_movie_from_storage():
     return similar_movie
 
 
-@app.get("/movies")
-def movies():
-    return get_movies()
+@app.post("/movies")
+def movies(params: SearchAssetParams):
+    return get_movies(start_year=params.start_year, end_year=params.end_year, genres=params.genres)
 
-@app.get("/tv")
-def tv():
-    return get_tv()
+@app.post("/tv")
+def tv(params: SearchAssetParams):
+    tv_show = get_tv(start_year=params.start_year, end_year=params.end_year, genres=params.genres)
+    print(tv_show)
+    return tv_show
 
 
 @app.get("/get_user_preferences")
@@ -374,4 +380,10 @@ def search_nearby_places(location: LocationData) -> List[str]:
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get('/movie_genres')
+def movie_genres():
+    return get_movie_genres()
 
+@app.get('/tv_genres')
+def tv_genres():
+    return get_tv_genres()

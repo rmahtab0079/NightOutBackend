@@ -3,6 +3,7 @@ import requests
 import os
 import threading
 from queue import Queue
+from typing import List
 
 
 # file_path = "./models/movies_dataset.csv"
@@ -25,7 +26,61 @@ from queue import Queue
 BASE_IMAGE_URL = "https://image.tmdb.org/t/p/"
 DEFAULT_IMAGE_SIZE = "w200"  # Customize based on required size (e.g., "original", "w300", etc.)
 
-def get_assets(asset_type: str):
+
+def _extract_year(date_str: str) -> int | None:
+    """Extract year from a date string like '2024-05-15' or '2024'."""
+    if not date_str:
+        return None
+    try:
+        return int(date_str.split("-")[0])
+    except (ValueError, IndexError):
+        return None
+
+
+def _filter_assets(
+    assets: List[dict],
+    asset_type: str,
+    start_year: int,
+    end_year: int,
+    genres: List[int],
+) -> List[dict]:
+    """
+    Filter assets by genre IDs and release year range.
+    - asset_type: 'movie' uses 'release_date', 'tv' uses 'first_air_date'
+    - genres: if non-empty, asset must have at least one matching genre_id
+    - start_year/end_year: inclusive range for the release/air year
+    """
+    date_field = "release_date" if asset_type == "movie" else "first_air_date"
+    filtered = []
+
+    for asset in assets:
+        # --- Genre filter ---
+        if genres:
+            asset_genres = asset.get("genre_ids", [])
+            if not any(g in genres for g in asset_genres):
+                continue
+
+        # --- Year filter ---
+        date_str = asset.get(date_field, "")
+        year = _extract_year(date_str)
+        if year is not None:
+            if year < start_year or year > end_year:
+                continue
+
+        filtered.append(asset)
+
+    return filtered
+
+
+def get_assets(
+    asset_type: str,
+    start_year: int = 1970,
+    end_year: int = 2026,
+    genres: List[int] = None,
+):
+    if genres is None:
+        genres = []
+
     tmdb_api_key = os.getenv("TMDB_API_KEY")
     results_queue = Queue()
 
@@ -45,18 +100,24 @@ def get_assets(asset_type: str):
     responses.sort(key=lambda x: x["page"])
 
     # Flatten pages and build a TMDB-like envelope expected by the client
-    page = 1
-    total_pages = len(responses)
-    total_results = sum(len(r.get("results", [])) for r in responses)
     merged_results = []
     for r in responses:
         merged_results.extend(r.get("results", []))
 
+    # Apply filters
+    filtered_results = _filter_assets(
+        merged_results,
+        asset_type=asset_type,
+        start_year=start_year,
+        end_year=end_year,
+        genres=genres,
+    )
+
     return {
-        "page": page,
-        "total_pages": total_pages,
-        "total_results": total_results,
-        "results": merged_results,
+        "page": 1,
+        "total_pages": 1,
+        "total_results": len(filtered_results),
+        "results": filtered_results,
     }
 
 

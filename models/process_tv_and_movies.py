@@ -1,6 +1,7 @@
 import os
 import json
 import requests
+import wikipedia
 
 import pandas as pd
 from scipy.spatial.distance import pdist, squareform
@@ -104,6 +105,40 @@ def get_asset_df(asset_type : str) -> pd.DataFrame:
 
     return asset_df
 
+def get_movie_plot(movie_name: str) -> str:
+    try:
+        page = wikipedia.page(f"{movie_name} (film)")
+        plot = page.section("Plot")
+        return plot if plot else "Plot section not found"
+    except wikipedia.exceptions.DisambiguationError as e:
+        # Handle multiple matches - try the first one
+        page = wikipedia.page(e.options[0])
+        return page.section("Plot")
+    except wikipedia.exceptions.PageError:
+        return "Page not found"
+
+
+def get_movie_ids_from_names(names: list[str]) -> set[int]:
+    asset_df = get_asset_df("movies")
+    filtered_df = asset_df[asset_df['original_title'].isin(names)]
+    print(filtered_df)
+    return set(filtered_df['id'].tolist())
+
+def get_tv_ids_from_names(names: list[str]) -> set[int]:
+    asset_df = get_asset_df("tv")
+    filtered_df = asset_df[asset_df['original_name'].isin(names)]
+    print(filtered_df)
+    return set(filtered_df['id'].tolist())
+
+def get_movie_names_from_ids(ids: set[int]) -> list[str]:
+    asset_df = get_asset_df("movies")
+    filtered_df = asset_df[asset_df['id'].isin(ids)]
+    return filtered_df['original_title'].tolist()
+
+def get_tv_names_from_ids(ids: set[int]) -> list[str]:
+    asset_df = get_asset_df("tv")
+    filtered_df = asset_df[asset_df['id'].isin(ids)]
+    return filtered_df['original_name'].tolist()
 
 def genre_similarity(movies: set[int], asset_type: str) -> pd.DataFrame:
     """
@@ -170,7 +205,7 @@ def overview_similarity(movies: set[int], asset_type) -> pd.DataFrame:
     return ordered_similarities
 
 
-def get_movie_detail(movie_id: int, asset_type: str):
+def get_movie_detail(movie_id: int, asset_type: str, tmdb_api_key="2ed2b9d2e44bf6e9a70b687c134ed8f9"):
     url = f"https://api.themoviedb.org/3/{asset_type}/{movie_id}?language=en-US&api_key={tmdb_api_key}"
     #url = f"https://api.themoviedb.org/3/{asset_type}/{movie_id}?language=en-US&api_key=2ed2b9d2e44bf6e9a70b687c134ed8f9"
     response = requests.get(url)
@@ -182,13 +217,21 @@ def get_movie_detail(movie_id: int, asset_type: str):
         print(f"Request failed with status code {response.json()}")
 
 
-def find_similar_asset(assets: set[int], asset_type: str):
-    if asset_type == 'movie':
-        asset_df =  get_asset_df_from_storage(movies_path, asset_type)
-        title = "original_title"
+def find_similar_asset(assets: set[int], asset_type: str, read_from_local: bool = False):
+    if read_from_local:
+        if asset_type == 'movie':
+            asset_df = get_asset_df("movies")
+            title = "original_title"
+        else:
+            asset_df = get_asset_df("tv")
+            title = "original_name"
     else:
-        asset_df = get_asset_df_from_storage(tv_path, asset_type)
-        title = "original_name"
+        if asset_type == 'movie':
+            asset_df =  get_asset_df_from_storage(movies_path, asset_type)
+            title = "original_title"
+        else:   
+            asset_df = get_asset_df_from_storage(tv_path, asset_type)
+            title = "original_name"
     asset_df.set_index('id', inplace=True)
     genre_similarity_df = genre_similarity(assets, asset_type)
     overview_similarity_df = overview_similarity(assets, asset_type)
@@ -209,8 +252,8 @@ def find_similar_asset(assets: set[int], asset_type: str):
     # Find first non-sequel/prequel movie
     for curr_asset_id in combined_df.index:
         # Skip if it's one of the input movies
-        if curr_asset_id in assets:
-            continue
+        # if curr_asset_id in assets:
+        #     continue
 
         # Ensure the candidate exists in the DataFrame and language column is present
         if curr_asset_id not in asset_df.index:
@@ -245,6 +288,168 @@ def find_similar_asset(assets: set[int], asset_type: str):
             return asset_detail
 
     return None
+
+
+def find_similar_asset_v2(assets: set[int], asset_type: str, read_from_local: bool = False, top_n: int = 5):
+    """
+    Find similar movies using genre similarity + Wikipedia plot TF-IDF cosine similarity.
+    
+    1. Get top 100 genre-similar movies
+    2. Fetch Wikipedia plots for input movies and candidates
+    3. Create TF-IDF vectors from plots
+    4. Compute cosine similarity to input movies
+    5. Return top N most similar movies
+    """
+    # Get asset DataFrame
+    if read_from_local:
+        if asset_type == 'movie':
+            asset_df = get_asset_df("movies")
+            title = "original_title"
+        else:
+            asset_df = get_asset_df("tv")
+            title = "original_name"
+    else:
+        if asset_type == 'movie':
+            asset_df = get_asset_df_from_storage(movies_path, asset_type)
+            title = "original_title"
+        else:
+            asset_df = get_asset_df_from_storage(tv_path, asset_type)
+            title = "original_name"
+    
+    asset_df.set_index('id', inplace=True)
+    
+    # Normalize asset_type for functions that expect "movies"/"tv"
+    asset_type_plural = "movies" if asset_type == "movie" else "tv"
+    
+    # Step 1: Get top 100 genre-similar movies
+    genre_sim_df = genre_similarity(assets, asset_type_plural)
+    top_100_candidates = genre_sim_df.head(100).index.tolist()
+    
+    # Remove input movies from candidates
+    top_100_candidates = [m for m in top_100_candidates if m not in assets]
+    
+    print(f"Found {len(top_100_candidates)} genre-similar candidates")
+    
+    # Step 2: Get movie names for input movies and candidates
+    input_movie_names = {}
+    for movie_id in assets:
+        if movie_id in asset_df.index:
+            input_movie_names[movie_id] = asset_df.loc[movie_id, title]
+    
+    candidate_movie_names = {}
+    for movie_id in top_100_candidates:
+        if movie_id in asset_df.index:
+            candidate_movie_names[movie_id] = asset_df.loc[movie_id, title]
+    
+    # Step 3: Fetch Wikipedia plots
+    print("Fetching Wikipedia plots for input movies...")
+    input_plots = {}
+    for movie_id, movie_name in input_movie_names.items():
+        plot = get_movie_plot(movie_name)
+        if plot and plot not in ["Plot section not found", "Page not found"]:
+            input_plots[movie_id] = plot
+            print(f"  Got plot for: {movie_name}")
+        else:
+            print(f"  No plot found for: {movie_name}")
+    
+    if not input_plots:
+        raise ValueError("Could not fetch plots for any input movies")
+    
+    print(f"\nFetching Wikipedia plots for {len(candidate_movie_names)} candidates...")
+    candidate_plots = {}
+    for movie_id, movie_name in candidate_movie_names.items():
+        plot = get_movie_plot(movie_name)
+        if plot and plot not in ["Plot section not found", "Page not found"]:
+            candidate_plots[movie_id] = plot
+    
+    print(f"Successfully fetched {len(candidate_plots)} candidate plots")
+    
+    if not candidate_plots:
+        raise ValueError("Could not fetch plots for any candidate movies")
+    
+    # Step 4: Create TF-IDF vectors
+    all_movie_ids = list(input_plots.keys()) + list(candidate_plots.keys())
+    all_plots = list(input_plots.values()) + list(candidate_plots.values())
+    
+    vectorizer = TfidfVectorizer(stop_words='english', min_df=1, max_df=0.95)
+    tfidf_matrix = vectorizer.fit_transform(all_plots)
+    
+    tfidf_df = pd.DataFrame(
+        tfidf_matrix.toarray(),
+        index=all_movie_ids,
+        columns=vectorizer.get_feature_names_out()
+    )
+    
+    # Step 5: Compute cosine similarity
+    # Create user profile by averaging input movie TF-IDF vectors
+    input_movie_ids = list(input_plots.keys())
+    user_profile = tfidf_df.loc[input_movie_ids].mean(axis=0).values.reshape(1, -1)
+    
+    # Get candidate vectors
+    candidate_ids = list(candidate_plots.keys())
+    candidate_vectors = tfidf_df.loc[candidate_ids].values
+    
+    # Compute cosine similarity between user profile and all candidates
+    similarities = cosine_similarity(user_profile, candidate_vectors)[0]
+    
+    # Create results DataFrame
+    results_df = pd.DataFrame({
+        'movie_id': candidate_ids,
+        'similarity': similarities
+    })
+    results_df = results_df.sort_values('similarity', ascending=False)
+    
+    # Step 6: Filter out sequels/prequels and return top N
+    results = []
+    for _, row in results_df.iterrows():
+        movie_id = row['movie_id']
+        
+        if movie_id not in asset_df.index:
+            continue
+            
+        # Check language
+        if 'original_language' in asset_df.columns:
+            if asset_df.at[movie_id, 'original_language'] != "en":
+                continue
+        
+        movie_title = asset_df.loc[movie_id, title]
+        
+        # Check if sequel/prequel of any input movie
+        is_related = False
+        for input_id in assets:
+            if input_id in asset_df.index:
+                input_title = asset_df.at[input_id, title]
+                if input_title and str(input_title).strip():
+                    if is_sequel_or_prequel(str(input_title), movie_title):
+                        is_related = True
+                        break
+        
+        if not is_related:
+            movie_detail = get_movie_detail(movie_id, asset_type)
+            results.append({
+                'movie_id': movie_id,
+                'title': movie_title,
+                'similarity': row['similarity'],
+                'detail': movie_detail
+            })
+            print(f"Found: {movie_title} (similarity: {row['similarity']:.3f})")
+            
+            if len(results) >= top_n:
+                break
+
+    # TODO: Accept Input Params Genres, Years Range.
+    # TODO: Create a job that runs this every day. for each genre and year range.
+    # TODO: Store the results in a database.
+    # TODO: Return the results to the user.
+    # TODO: Cache the results for 1 hour.
+    # TODO: If the results are not found in the cache, fetch them from the database.
+    # TODO: If the results are not found in the database, fetch them from the API.
+    # TODO: Store the results in the cache.
+    # TODO: Return the results to the user.
+    # TODO: Cache the results for 1 hour.
+    # TODO: If the results are not found in the cache, fetch them from the database.
+    
+    return results
 
 
 def is_sequel_or_prequel(original_movie: str, candidate_movie: str) -> bool:

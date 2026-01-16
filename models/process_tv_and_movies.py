@@ -20,6 +20,11 @@ tmdb_api_key = os.getenv("TMDB_API_KEY")
 DEFAULT_STORAGE_BUCKET = "nightoutclient-7931e.firebasestorage.app"
 movies_path = "movies_dataset.parquet"
 tv_path = "tv_dataset.parquet"
+movies_plots_path = "movies_plots.parquet"
+tv_plots_path = "tv_plots.parquet"
+
+# Cache for loaded plot DataFrames to avoid repeated downloads
+_plots_cache: dict[str, pd.DataFrame] = {}
 
 
 def _load_service_account_project_id(path: str | None) -> str | None:
@@ -91,6 +96,114 @@ def get_asset_df_from_storage(blob_path: str, asset_type: str) -> pd.DataFrame:
             os.remove(temp_path)
         except Exception:
             pass
+
+
+def get_plots_df_from_storage(blob_path: str) -> pd.DataFrame:
+    """
+    Load pre-computed Wikipedia plots from Firebase Storage.
+    Results are cached in memory to avoid repeated downloads.
+    
+    Args:
+        blob_path: Path to the plots parquet file in Firebase Storage
+        
+    Returns:
+        DataFrame with columns: id, name, plot
+    """
+    global _plots_cache
+    
+    # Check cache first
+    if blob_path in _plots_cache:
+        return _plots_cache[blob_path]
+    
+    _initialize_firebase_if_needed()
+    bucket_name = _infer_bucket_name()
+    bucket = storage.bucket(bucket_name)
+    blob = bucket.blob(blob_path)
+    
+    if not blob.exists():
+        raise FileNotFoundError(f"Plots file not found in bucket '{bucket.name}': {blob_path}")
+    
+    import tempfile
+    
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".parquet") as tmp_file:
+        temp_path = tmp_file.name
+    
+    try:
+        blob.download_to_filename(temp_path)
+        plots_df = pd.read_parquet(temp_path, engine="pyarrow")
+        
+        # Cache for future use
+        _plots_cache[blob_path] = plots_df
+        
+        print(f"Loaded {len(plots_df)} plots from {blob_path}")
+        return plots_df
+    finally:
+        try:
+            os.remove(temp_path)
+        except Exception:
+            pass
+
+
+def get_plots_df_local(asset_type: str) -> pd.DataFrame:
+    """
+    Load pre-computed Wikipedia plots from local datasets folder.
+    Results are cached in memory.
+    
+    Args:
+        asset_type: 'movies' or 'tv'
+        
+    Returns:
+        DataFrame with columns: id, name, plot
+    """
+    global _plots_cache
+    
+    if asset_type == 'movies':
+        file_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "datasets", "movies_plots.parquet")
+    else:
+        file_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "datasets", "tv_plots.parquet")
+    
+    # Check cache first
+    if file_path in _plots_cache:
+        return _plots_cache[file_path]
+    
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Plots file not found: {file_path}")
+    
+    plots_df = pd.read_parquet(file_path, engine="pyarrow")
+    
+    # Cache for future use
+    _plots_cache[file_path] = plots_df
+    
+    print(f"Loaded {len(plots_df)} plots from {file_path}")
+    return plots_df
+
+
+def get_plots_df(asset_type: str, read_from_local: bool = False) -> pd.DataFrame:
+    """
+    Get the plots DataFrame from either local storage or Firebase.
+    
+    Args:
+        asset_type: 'movie' or 'tv' (will be normalized internally)
+        read_from_local: If True, read from local datasets folder
+        
+    Returns:
+        DataFrame with columns: id, name, plot
+    """
+    # Normalize asset_type
+    asset_type_normalized = "movies" if asset_type == "movie" else asset_type
+    
+    if read_from_local:
+        return get_plots_df_local(asset_type_normalized)
+    else:
+        blob_path = movies_plots_path if asset_type_normalized == "movies" else tv_plots_path
+        return get_plots_df_from_storage(blob_path)
+
+
+def clear_plots_cache() -> None:
+    """Clear the in-memory plots cache."""
+    global _plots_cache
+    _plots_cache.clear()
+    print("Plots cache cleared")
 
 
 def get_asset_df(asset_type : str) -> pd.DataFrame:
@@ -292,10 +405,13 @@ def find_similar_asset(assets: set[int], asset_type: str, read_from_local: bool 
 
 def find_similar_asset_v2(assets: set[int], asset_type: str, read_from_local: bool = False, top_n: int = 5):
     """
-    Find similar movies using genre similarity + Wikipedia plot TF-IDF cosine similarity.
+    Find similar movies using genre similarity + pre-computed Wikipedia plot TF-IDF cosine similarity.
+    
+    This optimized version uses pre-computed Wikipedia plots from parquet files
+    instead of fetching plots dynamically, making inference much faster.
     
     1. Get top 100 genre-similar movies
-    2. Fetch Wikipedia plots for input movies and candidates
+    2. Load pre-computed Wikipedia plots from parquet
     3. Create TF-IDF vectors from plots
     4. Compute cosine similarity to input movies
     5. Return top N most similar movies
@@ -330,42 +446,41 @@ def find_similar_asset_v2(assets: set[int], asset_type: str, read_from_local: bo
     
     print(f"Found {len(top_100_candidates)} genre-similar candidates")
     
-    # Step 2: Get movie names for input movies and candidates
-    input_movie_names = {}
-    for movie_id in assets:
-        if movie_id in asset_df.index:
-            input_movie_names[movie_id] = asset_df.loc[movie_id, title]
+    # Step 2: Load pre-computed Wikipedia plots
+    print("Loading pre-computed Wikipedia plots...")
+    try:
+        plots_df = get_plots_df(asset_type, read_from_local)
+    except FileNotFoundError as e:
+        print(f"Warning: Pre-computed plots not found ({e}). Falling back to overview similarity.")
+        # Fallback to overview-based similarity if plots not available
+        return _find_similar_asset_fallback(assets, asset_df, asset_type, title, genre_sim_df, top_n)
     
-    candidate_movie_names = {}
-    for movie_id in top_100_candidates:
-        if movie_id in asset_df.index:
-            candidate_movie_names[movie_id] = asset_df.loc[movie_id, title]
+    # Create a lookup dict for fast access: id -> plot
+    plots_lookup = dict(zip(plots_df['id'], plots_df['plot']))
+    print(f"Loaded {len(plots_lookup)} pre-computed plots")
     
-    # Step 3: Fetch Wikipedia plots
-    print("Fetching Wikipedia plots for input movies...")
+    # Step 3: Get plots for input movies and candidates
     input_plots = {}
-    for movie_id, movie_name in input_movie_names.items():
-        plot = get_movie_plot(movie_name)
-        if plot and plot not in ["Plot section not found", "Page not found"]:
-            input_plots[movie_id] = plot
-            print(f"  Got plot for: {movie_name}")
-        else:
-            print(f"  No plot found for: {movie_name}")
+    for movie_id in assets:
+        if movie_id in plots_lookup:
+            input_plots[movie_id] = plots_lookup[movie_id]
+    
+    print(f"Found plots for {len(input_plots)}/{len(assets)} input movies")
     
     if not input_plots:
-        raise ValueError("Could not fetch plots for any input movies")
+        print("Warning: No plots found for input movies. Falling back to overview similarity.")
+        return _find_similar_asset_fallback(assets, asset_df, asset_type, title, genre_sim_df, top_n)
     
-    print(f"\nFetching Wikipedia plots for {len(candidate_movie_names)} candidates...")
     candidate_plots = {}
-    for movie_id, movie_name in candidate_movie_names.items():
-        plot = get_movie_plot(movie_name)
-        if plot and plot not in ["Plot section not found", "Page not found"]:
-            candidate_plots[movie_id] = plot
+    for movie_id in top_100_candidates:
+        if movie_id in plots_lookup:
+            candidate_plots[movie_id] = plots_lookup[movie_id]
     
-    print(f"Successfully fetched {len(candidate_plots)} candidate plots")
+    print(f"Found plots for {len(candidate_plots)}/{len(top_100_candidates)} candidates")
     
     if not candidate_plots:
-        raise ValueError("Could not fetch plots for any candidate movies")
+        print("Warning: No plots found for candidates. Falling back to overview similarity.")
+        return _find_similar_asset_fallback(assets, asset_df, asset_type, title, genre_sim_df, top_n)
     
     # Step 4: Create TF-IDF vectors
     all_movie_ids = list(input_plots.keys()) + list(candidate_plots.keys())
@@ -437,6 +552,71 @@ def find_similar_asset_v2(assets: set[int], asset_type: str, read_from_local: bo
             if len(results) >= top_n:
                 break
 
+    return results
+
+
+def _find_similar_asset_fallback(
+    assets: set[int],
+    asset_df: pd.DataFrame,
+    asset_type: str,
+    title: str,
+    genre_sim_df: pd.Series,
+    top_n: int
+) -> list[dict]:
+    """
+    Fallback method using overview similarity when Wikipedia plots are not available.
+    Uses the existing overview column from the main dataset instead of Wikipedia plots.
+    """
+    print("Using fallback: overview-based similarity")
+    
+    asset_type_plural = "movies" if asset_type == "movie" else "tv"
+    overview_sim_df = overview_similarity(assets, asset_type_plural)
+    
+    # Combine genre and overview similarity
+    combined_df = pd.DataFrame({
+        'genre_sim': genre_sim_df,
+        'overview_sim': overview_sim_df
+    })
+    combined_df['combined_score'] = (combined_df['genre_sim'] * 0.5 + 
+                                      combined_df['overview_sim'] * 0.5)
+    combined_df = combined_df.sort_values('combined_score', ascending=False)
+    
+    results = []
+    for movie_id in combined_df.index:
+        if movie_id in assets:
+            continue
+            
+        if movie_id not in asset_df.index:
+            continue
+        
+        if 'original_language' in asset_df.columns:
+            if asset_df.at[movie_id, 'original_language'] != "en":
+                continue
+        
+        movie_title = asset_df.loc[movie_id, title]
+        
+        is_related = False
+        for input_id in assets:
+            if input_id in asset_df.index:
+                input_title = asset_df.at[input_id, title]
+                if input_title and str(input_title).strip():
+                    if is_sequel_or_prequel(str(input_title), movie_title):
+                        is_related = True
+                        break
+        
+        if not is_related:
+            movie_detail = get_movie_detail(movie_id, asset_type)
+            results.append({
+                'movie_id': movie_id,
+                'title': movie_title,
+                'similarity': combined_df.loc[movie_id, 'combined_score'],
+                'detail': movie_detail
+            })
+            print(f"Found (fallback): {movie_title} (score: {combined_df.loc[movie_id, 'combined_score']:.3f})")
+            
+            if len(results) >= top_n:
+                break
+    
     return results
 
 

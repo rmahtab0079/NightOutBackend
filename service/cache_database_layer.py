@@ -77,7 +77,8 @@ def _generate_cache_key(
     genres: list[int] | None = None,
     start_year: int | None = None,
     end_year: int | None = None,
-    top_n: int = 5
+    top_n: int = 5,
+    excluded_ids: set[int] | None = None
 ) -> str:
     """
     Generate a unique cache key based on input parameters.
@@ -85,6 +86,7 @@ def _generate_cache_key(
     """
     sorted_ids = sorted(asset_ids)
     sorted_genres = sorted(genres) if genres else []
+    sorted_excluded = sorted(excluded_ids) if excluded_ids else []
     
     key_data = {
         "asset_ids": sorted_ids,
@@ -92,7 +94,8 @@ def _generate_cache_key(
         "genres": sorted_genres,
         "start_year": start_year,
         "end_year": end_year,
-        "top_n": top_n
+        "top_n": top_n,
+        "excluded_ids": sorted_excluded
     }
     
     key_string = json.dumps(key_data, sort_keys=True)
@@ -197,10 +200,11 @@ def _filter_results_by_params(
     genres: list[int] | None,
     start_year: int | None,
     end_year: int | None,
-    asset_type: str
+    asset_type: str,
+    excluded_ids: set[int] | None = None
 ) -> list[dict]:
     """
-    Filter API results by genre IDs and release year range.
+    Filter API results by genre IDs, release year range, and excluded IDs.
     
     Args:
         results: List of recommendation results with 'detail' containing TMDB data
@@ -208,14 +212,20 @@ def _filter_results_by_params(
         start_year: Minimum release year (inclusive)
         end_year: Maximum release year (inclusive)
         asset_type: 'movie' or 'tv'
+        excluded_ids: Set of asset IDs to exclude (e.g., disliked items)
     """
-    if not genres and not start_year and not end_year:
+    if not genres and not start_year and not end_year and not excluded_ids:
         return results
     
     date_field = "release_date" if asset_type == "movie" else "first_air_date"
     filtered = []
     
     for result in results:
+        # Exclude by ID (disliked items)
+        movie_id = result.get("movie_id")
+        if excluded_ids and movie_id in excluded_ids:
+            continue
+        
         detail = result.get("detail", {})
         
         # Genre filter
@@ -251,7 +261,8 @@ def get_similar_assets(
     end_year: int | None = None,
     top_n: int = 5,
     read_from_local: bool = False,
-    bypass_cache: bool = False
+    bypass_cache: bool = False,
+    excluded_ids: set[int] | None = None
 ) -> list[dict]:
     """
     Get similar assets with caching support.
@@ -271,18 +282,20 @@ def get_similar_assets(
         top_n: Number of recommendations to return
         read_from_local: If True, read from local parquet files instead of Firebase Storage
         bypass_cache: If True, skip cache and fetch fresh results
+        excluded_ids: Set of asset IDs to exclude from results (e.g., disliked items)
     
     Returns:
         List of similar asset recommendations with details
     """
-    # Generate cache key
+    # Generate cache key (includes excluded_ids for proper cache isolation)
     cache_key = _generate_cache_key(
         asset_ids=asset_ids,
         asset_type=asset_type,
         genres=genres,
         start_year=start_year,
         end_year=end_year,
-        top_n=top_n
+        top_n=top_n,
+        excluded_ids=excluded_ids
     )
     
     if not bypass_cache:
@@ -302,7 +315,9 @@ def get_similar_assets(
     print("Cache miss - fetching from API...")
     
     # Request more results than needed to account for filtering
-    fetch_count = top_n * 3 if (genres or start_year or end_year) else top_n
+    # Increase multiplier when excluded_ids is present to ensure we have enough after filtering
+    has_filters = genres or start_year or end_year or excluded_ids
+    fetch_count = max(top_n * 5, 20) if has_filters else max(top_n * 2, 10)
     
     try:
         api_results = find_similar_asset_v2(
@@ -315,13 +330,14 @@ def get_similar_assets(
         print(f"API fetch error: {e}")
         raise
     
-    # Apply genre and year filters
+    # Apply genre, year, and exclusion filters
     filtered_results = _filter_results_by_params(
         results=api_results,
         genres=genres,
         start_year=start_year,
         end_year=end_year,
-        asset_type=asset_type
+        asset_type=asset_type,
+        excluded_ids=excluded_ids
     )
     
     # Limit to requested top_n

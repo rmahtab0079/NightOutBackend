@@ -110,6 +110,11 @@ class UpdatePreferenceRequest(BaseModel):
     itemId: int  # ID to add
 
 
+class AddAssetRequest(BaseModel):
+    asset_type: str  # 'movie' or 'tv'
+    asset_id: int  # ID of the movie or TV show
+
+
 # Initialize Firebase Admin (with placeholders)
 FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "nightoutclient-7931e")
 FIREBASE_SERVICE_ACCOUNT_PATH = os.getenv(
@@ -284,6 +289,127 @@ async def update_user_preferences(payload: UpdatePreferenceRequest, authorizatio
     except Exception as e:
         print(e)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/user_preferences/add_watched")
+async def add_watched_asset(payload: AddAssetRequest, authorization: Optional[str] = Header(default=None)):
+    """
+    Add a movie or TV show to the user's watched list.
+    - For movies: adds to 'movieIds' field
+    - For TV shows: adds to 'tvShowIds' field
+    """
+    initialize_firebase_if_needed()
+    if firebase_db is None:
+        raise HTTPException(
+            status_code=501,
+            detail=(
+                "Firebase not configured. Set FIREBASE_SERVICE_ACCOUNT_PATH and "
+                "FIREBASE_PROJECT_ID environment variables to enable writes."
+            ),
+        )
+
+    # Verify user and get email from token
+    decoded = _verify_and_get_user(authorization)
+    email_from_token = decoded.get("email")
+    if not email_from_token:
+        raise HTTPException(status_code=400, detail="Email not found in token")
+
+    # Determine field name based on asset type
+    if payload.asset_type.lower() == "movie":
+        field_name = "movieIds"
+    elif payload.asset_type.lower() == "tv":
+        field_name = "tvShowIds"
+    else:
+        raise HTTPException(status_code=400, detail="Invalid asset_type. Use 'movie' or 'tv'.")
+
+    try:
+        collection_ref = firebase_db.collection("user_preferences")
+        doc_ref = collection_ref.document(email_from_token)
+        doc = doc_ref.get()
+        
+        if not doc.exists:
+            # Create the document if it doesn't exist
+            doc_ref.set({
+                "email": email_from_token,
+                field_name: [payload.asset_id],
+                "createdAt": datetime.utcnow().isoformat() + "Z"
+            })
+        else:
+            # Use Firestore ArrayUnion to add if not present
+            doc_ref.update({field_name: firestore.ArrayUnion([payload.asset_id])})
+        
+        return {
+            "message": "Asset added to watched list",
+            "field": field_name,
+            "asset_id": payload.asset_id
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/user_preferences/add_disliked")
+async def add_disliked_asset(payload: AddAssetRequest, authorization: Optional[str] = Header(default=None)):
+    """
+    Add a movie or TV show to the user's disliked list.
+    - For movies: adds to 'dislikedMovieIds' field
+    - For TV shows: adds to 'dislikedTvShowIds' field
+    
+    These disliked items should be excluded from future recommendations.
+    """
+    initialize_firebase_if_needed()
+    if firebase_db is None:
+        raise HTTPException(
+            status_code=501,
+            detail=(
+                "Firebase not configured. Set FIREBASE_SERVICE_ACCOUNT_PATH and "
+                "FIREBASE_PROJECT_ID environment variables to enable writes."
+            ),
+        )
+
+    # Verify user and get email from token
+    decoded = _verify_and_get_user(authorization)
+    email_from_token = decoded.get("email")
+    if not email_from_token:
+        raise HTTPException(status_code=400, detail="Email not found in token")
+
+    # Determine field name based on asset type
+    if payload.asset_type.lower() == "movie":
+        field_name = "dislikedMovieIds"
+    elif payload.asset_type.lower() == "tv":
+        field_name = "dislikedTvShowIds"
+    else:
+        raise HTTPException(status_code=400, detail="Invalid asset_type. Use 'movie' or 'tv'.")
+
+    try:
+        collection_ref = firebase_db.collection("user_preferences")
+        doc_ref = collection_ref.document(email_from_token)
+        doc = doc_ref.get()
+        
+        if not doc.exists:
+            # Create the document if it doesn't exist
+            doc_ref.set({
+                "email": email_from_token,
+                field_name: [payload.asset_id],
+                "createdAt": datetime.utcnow().isoformat() + "Z"
+            })
+        else:
+            # Use Firestore ArrayUnion to add if not present
+            doc_ref.update({field_name: firestore.ArrayUnion([payload.asset_id])})
+        
+        return {
+            "message": "Asset added to disliked list",
+            "field": field_name,
+            "asset_id": payload.asset_id
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(e)
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/user_preferences")
 async def submit_user_preferences(preferences: UserPreferences, authorization: Optional[str] = Header(default=None)):
@@ -471,12 +597,18 @@ async def get_recommended_movie_v2(
     - end_year: Maximum release year filter
     - top_n: Number of recommendations (default: 5)
     - bypass_cache: Skip cache for fresh results
+    
+    Disliked movies (from dislikedMovieIds field) are automatically excluded.
     """
     user_preferences = await get_user_preferences(authorization)
     movie_ids = user_preferences.get("movieIds", [])
     
     if not movie_ids:
         raise HTTPException(status_code=400, detail="No movie preferences found for user")
+    
+    # Get disliked movie IDs to exclude from recommendations
+    disliked_movie_ids = user_preferences.get("dislikedMovieIds", [])
+    excluded_ids = set(disliked_movie_ids) if disliked_movie_ids else None
     
     # Parse genres from comma-separated string
     genre_list = None
@@ -495,7 +627,8 @@ async def get_recommended_movie_v2(
             end_year=end_year,
             top_n=top_n,
             read_from_local=False,
-            bypass_cache=bypass_cache
+            bypass_cache=bypass_cache,
+            excluded_ids=excluded_ids
         )
         return {"results": results, "count": len(results)}
     except ValueError as e:
@@ -523,12 +656,18 @@ async def get_recommended_tv_v2(
     - end_year: Maximum first air date year filter
     - top_n: Number of recommendations (default: 5)
     - bypass_cache: Skip cache for fresh results
+    
+    Disliked TV shows (from dislikedTvShowIds field) are automatically excluded.
     """
     user_preferences = await get_user_preferences(authorization)
     tv_ids = user_preferences.get("tvShowIds", [])
     
     if not tv_ids:
         raise HTTPException(status_code=400, detail="No TV show preferences found for user")
+    
+    # Get disliked TV show IDs to exclude from recommendations
+    disliked_tv_ids = user_preferences.get("dislikedTvShowIds", [])
+    excluded_ids = set(disliked_tv_ids) if disliked_tv_ids else None
     
     # Parse genres from comma-separated string
     genre_list = None
@@ -547,7 +686,8 @@ async def get_recommended_tv_v2(
             end_year=end_year,
             top_n=top_n,
             read_from_local=False,
-            bypass_cache=bypass_cache
+            bypass_cache=bypass_cache,
+            excluded_ids=excluded_ids
         )
         return {"results": results, "count": len(results)}
     except ValueError as e:

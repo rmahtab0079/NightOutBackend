@@ -437,18 +437,6 @@ def find_similar_asset_v2(assets: set[int], asset_type: str, read_from_local: bo
             if len(results) >= top_n:
                 break
 
-    # TODO: Accept Input Params Genres, Years Range.
-    # TODO: Create a job that runs this every day. for each genre and year range.
-    # TODO: Store the results in a database.
-    # TODO: Return the results to the user.
-    # TODO: Cache the results for 1 hour.
-    # TODO: If the results are not found in the cache, fetch them from the database.
-    # TODO: If the results are not found in the database, fetch them from the API.
-    # TODO: Store the results in the cache.
-    # TODO: Return the results to the user.
-    # TODO: Cache the results for 1 hour.
-    # TODO: If the results are not found in the cache, fetch them from the database.
-    
     return results
 
 

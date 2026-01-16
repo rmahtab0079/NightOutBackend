@@ -49,6 +49,12 @@ from models.movies import get_movies
 from models.tv import get_tv
 from models.process_tv_and_movies import find_similar_asset
 from models.write_movies_csv import get_movie_genres, get_tv_genres
+from service.cache_database_layer import (
+    get_similar_assets,
+    clear_memory_cache,
+    clear_expired_firestore_cache,
+    get_cache_stats
+)
 
 api_key = "AIzaSyDW0X1gO6uVSPkYIa3R6sjRwNQrz-afYU0"
 
@@ -87,6 +93,16 @@ class SearchAssetParams(BaseModel):
     start_year: int = 1970
     end_year: int = 2026
     genres: List[int] = []  # Genre IDs to filter by (empty = all genres)
+
+
+class SimilarAssetParams(BaseModel):
+    asset_ids: List[int]  # IDs of movies or TV shows to find similar content for
+    asset_type: str = "movie"  # 'movie' or 'tv'
+    genres: List[int] = []  # Optional genre filter
+    start_year: Optional[int] = None  # Optional start year filter
+    end_year: Optional[int] = None  # Optional end year filter
+    top_n: int = 5  # Number of recommendations to return
+    bypass_cache: bool = False  # If True, skip cache and fetch fresh results
 
 class UpdatePreferenceRequest(BaseModel):
     key: str  # Firestore document key (email)
@@ -387,3 +403,175 @@ def movie_genres():
 @app.get('/tv_genres')
 def tv_genres():
     return get_tv_genres()
+
+
+# ============================================================================
+# CACHED SIMILAR ASSETS ENDPOINTS
+# ============================================================================
+
+@app.post("/similar_assets")
+def find_similar_assets_cached(params: SimilarAssetParams):
+    """
+    Find similar movies or TV shows with caching support.
+    
+    This endpoint uses a multi-layer caching strategy:
+    1. In-memory cache (1 hour TTL)
+    2. Firestore database for persistent storage
+    3. API fallback via find_similar_asset_v2
+    
+    Request body:
+    - asset_ids: List of movie or TV show IDs to find similar content for
+    - asset_type: 'movie' or 'tv' (default: 'movie')
+    - genres: Optional list of genre IDs to filter results
+    - start_year: Optional minimum release year filter
+    - end_year: Optional maximum release year filter
+    - top_n: Number of recommendations to return (default: 5)
+    - bypass_cache: If True, skip cache and fetch fresh results
+    """
+    if not params.asset_ids:
+        raise HTTPException(status_code=400, detail="asset_ids must not be empty")
+    
+    if params.asset_type not in ["movie", "tv"]:
+        raise HTTPException(status_code=400, detail="asset_type must be 'movie' or 'tv'")
+    
+    try:
+        results = get_similar_assets(
+            asset_ids=set(params.asset_ids),
+            asset_type=params.asset_type,
+            genres=params.genres if params.genres else None,
+            start_year=params.start_year,
+            end_year=params.end_year,
+            top_n=params.top_n,
+            read_from_local=False,
+            bypass_cache=params.bypass_cache
+        )
+        return {"results": results, "count": len(results)}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        print(f"Error finding similar assets: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/get_movie_suggestion_v2")
+async def get_recommended_movie_v2(
+    authorization: Optional[str] = Header(default=None),
+    genres: Optional[str] = None,
+    start_year: Optional[int] = None,
+    end_year: Optional[int] = None,
+    top_n: int = 5,
+    bypass_cache: bool = False
+):
+    """
+    Get movie recommendations based on user preferences with caching and filtering.
+    
+    Query params:
+    - genres: Comma-separated genre IDs (e.g., "28,12,878")
+    - start_year: Minimum release year filter
+    - end_year: Maximum release year filter
+    - top_n: Number of recommendations (default: 5)
+    - bypass_cache: Skip cache for fresh results
+    """
+    user_preferences = await get_user_preferences(authorization)
+    movie_ids = user_preferences.get("movieIds", [])
+    
+    if not movie_ids:
+        raise HTTPException(status_code=400, detail="No movie preferences found for user")
+    
+    # Parse genres from comma-separated string
+    genre_list = None
+    if genres:
+        try:
+            genre_list = [int(g.strip()) for g in genres.split(",")]
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid genres format. Use comma-separated integers.")
+    
+    try:
+        results = get_similar_assets(
+            asset_ids=set(movie_ids),
+            asset_type="movie",
+            genres=genre_list,
+            start_year=start_year,
+            end_year=end_year,
+            top_n=top_n,
+            read_from_local=False,
+            bypass_cache=bypass_cache
+        )
+        return {"results": results, "count": len(results)}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        print(f"Error getting movie suggestions: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/get_tv_suggestion_v2")
+async def get_recommended_tv_v2(
+    authorization: Optional[str] = Header(default=None),
+    genres: Optional[str] = None,
+    start_year: Optional[int] = None,
+    end_year: Optional[int] = None,
+    top_n: int = 5,
+    bypass_cache: bool = False
+):
+    """
+    Get TV show recommendations based on user preferences with caching and filtering.
+    
+    Query params:
+    - genres: Comma-separated genre IDs (e.g., "18,35,10765")
+    - start_year: Minimum first air date year filter
+    - end_year: Maximum first air date year filter
+    - top_n: Number of recommendations (default: 5)
+    - bypass_cache: Skip cache for fresh results
+    """
+    user_preferences = await get_user_preferences(authorization)
+    tv_ids = user_preferences.get("tvShowIds", [])
+    
+    if not tv_ids:
+        raise HTTPException(status_code=400, detail="No TV show preferences found for user")
+    
+    # Parse genres from comma-separated string
+    genre_list = None
+    if genres:
+        try:
+            genre_list = [int(g.strip()) for g in genres.split(",")]
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid genres format. Use comma-separated integers.")
+    
+    try:
+        results = get_similar_assets(
+            asset_ids=set(tv_ids),
+            asset_type="tv",
+            genres=genre_list,
+            start_year=start_year,
+            end_year=end_year,
+            top_n=top_n,
+            read_from_local=False,
+            bypass_cache=bypass_cache
+        )
+        return {"results": results, "count": len(results)}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        print(f"Error getting TV suggestions: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/cache/stats")
+def cache_statistics():
+    """Get cache statistics including memory and Firestore cache counts."""
+    return get_cache_stats()
+
+
+@app.post("/cache/clear/memory")
+def clear_memory_cache_endpoint():
+    """Clear the in-memory cache. Returns number of entries cleared."""
+    count = clear_memory_cache()
+    return {"cleared_entries": count, "cache": "memory"}
+
+
+@app.post("/cache/clear/expired")
+def clear_expired_cache_endpoint():
+    """Clear expired entries from Firestore cache. Returns number of entries deleted."""
+    count = clear_expired_firestore_cache()
+    return {"cleared_entries": count, "cache": "firestore"}

@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, Header, Request
 from starlette.middleware.base import BaseHTTPMiddleware
 import random
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional, List, Set
 from dotenv import load_dotenv
 import requests
 import json
@@ -47,7 +47,7 @@ else:
 
 from models.movies import get_movies
 from models.tv import get_tv
-from models.process_tv_and_movies import find_similar_asset
+from models.process_tv_and_movies import find_similar_asset, get_movie_detail
 from models.write_movies_csv import get_movie_genres, get_tv_genres
 from service.cache_database_layer import (
     get_similar_assets,
@@ -55,6 +55,20 @@ from service.cache_database_layer import (
     clear_expired_firestore_cache,
     get_cache_stats
 )
+from service.user_genre_recommendations import (
+    MOVIE_RECS_COLLECTION,
+    TV_RECS_COLLECTION,
+    precompute_all_user_genre_recommendations,
+    precompute_user_genre_recommendations_for_email,
+    start_genre_recommendation_scheduler,
+)
+from service.wiki_plot_job import generate_and_upload_plots
+
+# Start background genre recommendation job (runs every 5 minutes)
+if os.getenv("ENABLE_GENRE_RECS_JOB", "true").lower() == "true":
+    @app.on_event("startup")
+    async def _start_genre_recs_job():
+        start_genre_recommendation_scheduler(interval_seconds=300)
 
 api_key = "AIzaSyDW0X1gO6uVSPkYIa3R6sjRwNQrz-afYU0"
 
@@ -88,6 +102,8 @@ class UserPreferences(BaseModel):
     movieIds: List[int] = []
     tvShowIds: List[int] = []
     streamingServices: List[str] = []
+    dietaryPreferences: List[str] = []
+    cuisines: List[str] = []
 
 class SearchAssetParams(BaseModel):
     start_year: int = 1970
@@ -113,6 +129,18 @@ class UpdatePreferenceRequest(BaseModel):
 class AddAssetRequest(BaseModel):
     asset_type: str  # 'movie' or 'tv'
     asset_id: int  # ID of the movie or TV show
+
+
+class RecomputeGenreRecsRequest(BaseModel):
+    email: Optional[str] = None
+    asset_type: Optional[str] = None  # 'movie', 'tv', or None for both
+    limit_per_genre: int = 100
+
+
+class PlotRebuildRequest(BaseModel):
+    asset_type: str = "all"  # 'movies', 'tv', or 'all'
+    max_items: Optional[int] = None
+    read_from_storage: bool = True
 
 
 # Initialize Firebase Admin (with placeholders)
@@ -186,6 +214,51 @@ def _verify_and_get_user(authorization: Optional[str]) -> dict:
         raise HTTPException(status_code=401, detail=f"Invalid ID token: {e}")
 
 
+def _verify_admin_token(admin_token: Optional[str]) -> None:
+    expected = os.getenv("ADMIN_RECS_TOKEN")
+    if not expected:
+        raise HTTPException(status_code=501, detail="ADMIN_RECS_TOKEN is not configured")
+    if not admin_token or admin_token != expected:
+        raise HTTPException(status_code=403, detail="Invalid admin token")
+
+
+def _get_precomputed_genre_ids(
+    email: str,
+    asset_type: str,
+    genre_ids: List[int],
+) -> List[int]:
+    """
+    Fetch precomputed genre recommendations for a user.
+    Returns a deduped list of asset IDs for the requested genres.
+    """
+    initialize_firebase_if_needed()
+    if firebase_db is None:
+        return []
+
+    collection = MOVIE_RECS_COLLECTION if asset_type == "movie" else TV_RECS_COLLECTION
+    doc = firebase_db.collection(collection).document(email).get()
+    if not doc.exists:
+        return []
+
+    data = doc.to_dict() or {}
+    genre_map = data.get("genres", {})
+
+    ordered_ids: List[int] = []
+    seen: Set[int] = set()
+    for gid in genre_ids:
+        ids = genre_map.get(str(gid), [])
+        for asset_id in ids:
+            try:
+                aid = int(asset_id)
+            except Exception:
+                continue
+            if aid not in seen:
+                seen.add(aid)
+                ordered_ids.append(aid)
+
+    return ordered_ids
+
+
 @app.get("/")
 async def root():
     return {"message": "Hello World"}
@@ -193,6 +266,133 @@ async def root():
 @app.get("/hello/{name}")
 async def say_hello(name: str):
     return {"message": f"Hello {name}"}
+
+
+class NightInSuggestionRequest(BaseModel):
+    party_size: int
+    genres: List[int] = []
+
+
+class NightOutSuggestionRequest(BaseModel):
+    party_size: int
+    budget: Optional[str] = None
+    latitude: float
+    longitude: float
+    radius_meters: float = 10000.0
+    dietary_preferences: List[str] = []
+    cuisines: List[str] = []
+    excluded_names: List[str] = []
+
+
+BUDGET_TO_MAX_PRICE_LEVEL = {
+    "Free": 0,
+    "Under $20": 1,
+    "Under $50": 2,
+    "Under $100": 3,
+    "$100+": 4,
+}
+
+
+@app.get("/night_in_genres")
+def night_in_genres():
+    """Return movie + TV genres merged and deduplicated by name."""
+    movie_map = get_movie_genres()   # {id: name}
+    tv_map = get_tv_genres()         # {id: name}
+    seen_names: dict[str, int] = {}
+    for gid, name in {**movie_map, **tv_map}.items():
+        gid_int = int(gid) if isinstance(gid, str) else gid
+        if name not in seen_names:
+            seen_names[name] = gid_int
+    return {str(v): k for k, v in seen_names.items()}
+
+
+@app.post("/night_in_suggestion")
+async def get_night_in_suggestion(req: NightInSuggestionRequest):
+    from datetime import date
+    current_year = date.today().year
+
+    asset_type = random.choice(["movie", "tv"])
+    if asset_type == "movie":
+        data = get_movies(start_year=2000, end_year=current_year, genres=req.genres)
+    else:
+        data = get_tv(start_year=2000, end_year=current_year, genres=req.genres)
+
+    results = data.get("results", [])
+    if not results:
+        raise HTTPException(status_code=404, detail="No suggestions found")
+
+    pick = random.choice(results)
+    pick["asset_type"] = asset_type
+
+    try:
+        from service.watch_providers_job import get_providers_for_asset
+        providers = get_providers_for_asset(pick["id"], asset_type, read_from_local=False)
+        pick["watch_providers"] = providers
+    except Exception as e:
+        print(f"Could not fetch watch providers: {e}")
+        pick["watch_providers"] = []
+
+    return pick
+
+
+CUISINE_TO_PLACE_TYPES = {
+    "Italian": ["italian_restaurant"],
+    "Chinese": ["chinese_restaurant"],
+    "Japanese": ["japanese_restaurant", "sushi_restaurant", "ramen_restaurant"],
+    "Mexican": ["mexican_restaurant"],
+    "Indian": ["indian_restaurant"],
+    "Thai": ["thai_restaurant"],
+    "American": ["american_restaurant", "hamburger_restaurant", "steak_house"],
+    "Mediterranean": ["mediterranean_restaurant", "greek_restaurant", "lebanese_restaurant"],
+    "Korean": ["korean_restaurant"],
+    "French": ["french_restaurant"],
+    "Vietnamese": ["vietnamese_restaurant"],
+    "Caribbean": ["caribbean_restaurant"],
+    "Middle Eastern": ["middle_eastern_restaurant"],
+}
+
+
+@app.post("/night_out_suggestion")
+async def get_night_out_suggestion(req: NightOutSuggestionRequest):
+    included_types = list(places_of_interest)
+    if req.cuisines:
+        cuisine_types = []
+        for c in req.cuisines:
+            cuisine_types.extend(CUISINE_TO_PLACE_TYPES.get(c, []))
+        if cuisine_types:
+            included_types = cuisine_types
+
+    location = LocationData(latitude=req.latitude, longitude=req.longitude)
+    excluded = set(req.excluded_names)
+    max_price = BUDGET_TO_MAX_PRICE_LEVEL.get(req.budget)
+
+    MAX_RADIUS = 50000.0
+    current_radius = req.radius_meters
+
+    while current_radius <= MAX_RADIUS:
+        places = search_nearby_places(location, radius=current_radius, included_types=included_types)
+
+        if excluded:
+            places = [p for p in places if p["name"] not in excluded]
+
+        if max_price is not None:
+            places = [
+                p for p in places
+                if p.get("price_level") is None or p["price_level"] <= max_price
+            ]
+
+        if places:
+            break
+
+        current_radius *= 2
+        if current_radius > MAX_RADIUS:
+            raise HTTPException(status_code=404, detail="No places found nearby")
+
+    pick = random.choice(places)
+    pick["party_size"] = req.party_size
+    pick["budget"] = req.budget
+    pick["radius_used"] = current_radius
+    return pick
 
 @app.get("/find_similar_movie")
 def find_similar_movie_from_storage():
@@ -464,46 +664,53 @@ async def get_recommended_tv(authorization: Optional[str] = Header(default=None)
 
 @app.post("/random", response_model=Suggestion)
 async def get_random_suggestion(location: LocationData):
-    print(f"Received location data: {location}")
     nearby_places = search_nearby_places(location)
-    print(nearby_places)
-    # random_suggestions = [
-    #     "Take a walk at a Overpeck park",
-    #     "Go watch Bellarina at AMC Ridgefield Park",
-    #     "Go to the fair at the American Dream Mall",
-    # ]
-    #
-    new_suggestion = "Visit " + random.choice(nearby_places)
-
-    return Suggestion(suggestion=new_suggestion)
+    if not nearby_places:
+        raise HTTPException(status_code=404, detail="No places found nearby")
+    pick = random.choice(nearby_places)
+    return Suggestion(suggestion="Visit " + pick["name"])
 
 
 @app.get("/random", response_model=Suggestion)
 async def get_random_suggestion_get(latitude: float, longitude: float):
     location = LocationData(latitude=latitude, longitude=longitude)
-    print(f"Received location data (GET): {location}")
     nearby_places = search_nearby_places(location)
-    print(nearby_places)
-    new_suggestion = "Visit " + random.choice(nearby_places)
-    return Suggestion(suggestion=new_suggestion)
+    if not nearby_places:
+        raise HTTPException(status_code=404, detail="No places found nearby")
+    pick = random.choice(nearby_places)
+    return Suggestion(suggestion="Visit " + pick["name"])
 
 
-def search_nearby_places(location: LocationData) -> List[str]:
+def search_nearby_places(
+    location: LocationData,
+    radius: float = 10000.0,
+    included_types: List[str] | None = None,
+) -> List[dict]:
     endpoint_url = "https://places.googleapis.com/v1/places:searchNearby"
+    field_mask = ",".join([
+        "places.displayName",
+        "places.formattedAddress",
+        "places.rating",
+        "places.userRatingCount",
+        "places.photos",
+        "places.primaryType",
+        "places.editorialSummary",
+        "places.priceLevel",
+    ])
     headers = {
         "Content-Type": "application/json",
         "X-Goog-Api-Key": api_key,
-        "X-Goog-FieldMask": "places.displayName"
+        "X-Goog-FieldMask": field_mask,
     }
     json_payload = {
-        "includedTypes": places_of_interest,
+        "includedTypes": included_types or places_of_interest,
         "maxResultCount": 20,
         "locationRestriction": {
             "circle": {
                 "center": {
                     "latitude": location.latitude,
                     "longitude": location.longitude},
-                "radius": 10000.0
+                "radius": min(max(radius, 100.0), 50000.0)
             }
         }
     }
@@ -511,12 +718,38 @@ def search_nearby_places(location: LocationData) -> List[str]:
     try:
         response = requests.post(endpoint_url, json=json_payload, headers=headers)
         response_dict = response.json()
-        places = response_dict["places"]
+        places = response_dict.get("places", [])
         results = []
         for place in places:
-            print(place)
-            results.append(place['displayName']['text'])
+            name = place.get("displayName", {}).get("text", "Unknown")
+            photo_url = None
+            photos = place.get("photos", [])
+            if photos:
+                photo_ref = photos[0].get("name", "")
+                if photo_ref:
+                    photo_url = (
+                        f"https://places.googleapis.com/v1/{photo_ref}/media"
+                        f"?maxWidthPx=800&key={api_key}"
+                    )
+            price_str = place.get("priceLevel")
+            price_int = {
+                "PRICE_LEVEL_FREE": 0,
+                "PRICE_LEVEL_INEXPENSIVE": 1,
+                "PRICE_LEVEL_MODERATE": 2,
+                "PRICE_LEVEL_EXPENSIVE": 3,
+                "PRICE_LEVEL_VERY_EXPENSIVE": 4,
+            }.get(price_str)
 
+            results.append({
+                "name": name,
+                "address": place.get("formattedAddress"),
+                "rating": place.get("rating"),
+                "user_rating_count": place.get("userRatingCount"),
+                "photo_url": photo_url,
+                "type": place.get("primaryType"),
+                "summary": place.get("editorialSummary", {}).get("text"),
+                "price_level": price_int,
+            })
         return results
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -586,6 +819,7 @@ async def get_recommended_movie_v2(
     start_year: Optional[int] = None,
     end_year: Optional[int] = None,
     top_n: int = 5,
+    offset: int = 0,
     bypass_cache: bool = False
 ):
     """
@@ -596,6 +830,7 @@ async def get_recommended_movie_v2(
     - start_year: Minimum release year filter
     - end_year: Maximum release year filter
     - top_n: Number of recommendations (default: 5)
+    - offset: Number of results to skip for pagination (default: 0)
     - bypass_cache: Skip cache for fresh results
     
     Disliked movies (from dislikedMovieIds field) are automatically excluded.
@@ -617,20 +852,62 @@ async def get_recommended_movie_v2(
             genre_list = [int(g.strip()) for g in genres.split(",")]
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid genres format. Use comma-separated integers.")
+    if not genre_list:
+        raise HTTPException(status_code=400, detail="At least one genre is required.")
+    if start_year is None or end_year is None:
+        raise HTTPException(status_code=400, detail="start_year and end_year are required.")
     
     try:
+        # Prefer precomputed genre recommendations
+        email = user_preferences.get("email")
+        precomputed_ids = _get_precomputed_genre_ids(email, "movie", genre_list) if email else []
+
+        if precomputed_ids:
+            results = []
+            skipped = 0
+            for idx, movie_id in enumerate(precomputed_ids):
+                if excluded_ids and movie_id in excluded_ids:
+                    continue
+                detail = get_movie_detail(movie_id, "movie")
+                if not detail:
+                    continue
+                release_date = detail.get("release_date") or ""
+                if release_date:
+                    try:
+                        year = int(release_date.split("-")[0])
+                        if year < start_year or year > end_year:
+                            continue
+                    except Exception:
+                        pass
+                # Handle offset for pagination
+                if skipped < offset:
+                    skipped += 1
+                    continue
+                results.append({
+                    "movie_id": movie_id,
+                    "title": detail.get("title") or detail.get("original_title"),
+                    "similarity": max(0.0, 1.0 - (idx / max(len(precomputed_ids), 1))),
+                    "detail": detail,
+                })
+                if len(results) >= top_n:
+                    break
+            return {"results": results, "count": len(results), "offset": offset, "has_more": (skipped + len(results)) < len(precomputed_ids)}
+
+        # Fallback to dynamic recommendation
         results = get_similar_assets(
             asset_ids=set(movie_ids),
             asset_type="movie",
             genres=genre_list,
             start_year=start_year,
             end_year=end_year,
-            top_n=top_n,
+            top_n=top_n + offset,
             read_from_local=False,
             bypass_cache=bypass_cache,
             excluded_ids=excluded_ids
         )
-        return {"results": results, "count": len(results)}
+        # Apply offset to fallback results
+        paginated_results = results[offset:offset + top_n] if offset < len(results) else []
+        return {"results": paginated_results, "count": len(paginated_results), "offset": offset, "has_more": len(results) > (offset + top_n)}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -678,6 +955,37 @@ async def get_recommended_tv_v2(
             raise HTTPException(status_code=400, detail="Invalid genres format. Use comma-separated integers.")
     
     try:
+        # Prefer precomputed genre recommendations
+        email = user_preferences.get("email")
+        precomputed_ids = _get_precomputed_genre_ids(email, "tv", genre_list) if email else []
+
+        if precomputed_ids:
+            results = []
+            for idx, tv_id in enumerate(precomputed_ids):
+                if excluded_ids and tv_id in excluded_ids:
+                    continue
+                detail = get_movie_detail(tv_id, "tv")
+                if not detail:
+                    continue
+                first_air_date = detail.get("first_air_date") or ""
+                if first_air_date:
+                    try:
+                        year = int(first_air_date.split("-")[0])
+                        if year < start_year or year > end_year:
+                            continue
+                    except Exception:
+                        pass
+                results.append({
+                    "movie_id": tv_id,
+                    "title": detail.get("name") or detail.get("original_name"),
+                    "similarity": max(0.0, 1.0 - (idx / max(len(precomputed_ids), 1))),
+                    "detail": detail,
+                })
+                if len(results) >= top_n:
+                    break
+            return {"results": results, "count": len(results)}
+
+        # Fallback to dynamic recommendation
         results = get_similar_assets(
             asset_ids=set(tv_ids),
             asset_type="tv",
@@ -703,6 +1011,35 @@ def cache_statistics():
     return get_cache_stats()
 
 
+@app.get("/watch_providers/{asset_type}/{asset_id}")
+async def get_watch_providers(asset_type: str, asset_id: int):
+    """
+    Get watch providers for a movie or TV show.
+    
+    Returns streaming platforms where the content is available.
+    Data is fetched from precomputed parquet files.
+    
+    Path params:
+    - asset_type: 'movie' or 'tv'
+    - asset_id: TMDB movie or TV show ID
+    """
+    if asset_type not in ("movie", "tv"):
+        raise HTTPException(status_code=400, detail="asset_type must be 'movie' or 'tv'")
+    
+    try:
+        from service.watch_providers_job import get_providers_for_asset
+        providers = get_providers_for_asset(asset_id, asset_type, read_from_local=False)
+        return {
+            "asset_id": asset_id,
+            "asset_type": asset_type,
+            "providers": providers,
+            "count": len(providers),
+        }
+    except Exception as e:
+        print(f"Error fetching watch providers: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/cache/clear/memory")
 def clear_memory_cache_endpoint():
     """Clear the in-memory cache. Returns number of entries cleared."""
@@ -715,3 +1052,101 @@ def clear_expired_cache_endpoint():
     """Clear expired entries from Firestore cache. Returns number of entries deleted."""
     count = clear_expired_firestore_cache()
     return {"cleared_entries": count, "cache": "firestore"}
+
+
+@app.post("/user/refresh_recommendations")
+async def refresh_user_recommendations(
+    authorization: Optional[str] = Header(default=None),
+    asset_type: Optional[str] = None,
+    limit_per_genre: int = 100,
+):
+    """
+    Refresh the authenticated user's genre recommendations.
+    
+    This triggers recomputation of precomputed recommendations for the current user.
+    Use this after the user has viewed many movies to get fresh recommendations.
+    
+    Query params:
+    - asset_type: 'movie', 'tv', or omitted for both
+    - limit_per_genre: Number of recommendations per genre (default: 100)
+    """
+    user_preferences = await get_user_preferences(authorization)
+    email = user_preferences.get("email")
+    
+    if not email:
+        raise HTTPException(status_code=400, detail="User email not found")
+    
+    if asset_type not in (None, "movie", "tv"):
+        raise HTTPException(status_code=400, detail="asset_type must be 'movie', 'tv', or omitted")
+    
+    try:
+        precompute_user_genre_recommendations_for_email(
+            email=email,
+            limit_per_genre=limit_per_genre,
+            asset_type=asset_type,
+        )
+        return {
+            "status": "ok",
+            "email": email,
+            "asset_type": asset_type or "both",
+            "limit_per_genre": limit_per_genre,
+        }
+    except Exception as e:
+        print(f"Error refreshing recommendations for {email}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/admin/recompute_genre_recs")
+def recompute_genre_recommendations(
+    payload: RecomputeGenreRecsRequest,
+    x_admin_token: Optional[str] = Header(default=None),
+):
+    """
+    Trigger recomputation of precomputed genre recommendations.
+
+    - Provide email to recompute for a single user, otherwise recomputes all users.
+    - asset_type can be 'movie', 'tv', or omitted for both.
+    """
+    _verify_admin_token(x_admin_token)
+    if payload.asset_type not in (None, "movie", "tv"):
+        raise HTTPException(status_code=400, detail="asset_type must be 'movie', 'tv', or omitted")
+
+    if payload.email:
+        precompute_user_genre_recommendations_for_email(
+            email=payload.email,
+            limit_per_genre=payload.limit_per_genre,
+            asset_type=payload.asset_type,
+        )
+    else:
+        precompute_all_user_genre_recommendations(limit_per_genre=payload.limit_per_genre)
+
+    return {
+        "status": "ok",
+        "email": payload.email,
+        "asset_type": payload.asset_type or "both",
+        "limit_per_genre": payload.limit_per_genre,
+    }
+
+
+@app.post("/admin/rebuild_plot_parquets")
+def rebuild_plot_parquets(
+    payload: PlotRebuildRequest,
+    x_admin_token: Optional[str] = Header(default=None),
+):
+    _verify_admin_token(x_admin_token)
+    if payload.asset_type not in ("movies", "tv", "all"):
+        raise HTTPException(status_code=400, detail="asset_type must be 'movies', 'tv', or 'all'")
+
+    results = []
+    types = ["movies", "tv"] if payload.asset_type == "all" else [payload.asset_type]
+    for asset_type in types:
+        results.append(
+            generate_and_upload_plots(
+                asset_type=asset_type,
+                output_dir=os.path.join(os.path.dirname(__file__), "datasets"),
+                max_items=payload.max_items,
+                read_from_storage=payload.read_from_storage,
+            )
+        )
+
+    return {"status": "ok", "results": results}

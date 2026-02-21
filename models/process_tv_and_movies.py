@@ -318,13 +318,24 @@ def overview_similarity(movies: set[int], asset_type) -> pd.DataFrame:
     return ordered_similarities
 
 
-def get_movie_detail(movie_id: int, asset_type: str, tmdb_api_key="2ed2b9d2e44bf6e9a70b687c134ed8f9"):
+def get_movie_detail(movie_id: int, asset_type: str, tmdb_api_key="2ed2b9d2e44bf6e9a70b687c134ed8f9", include_providers: bool = True):
     url = f"https://api.themoviedb.org/3/{asset_type}/{movie_id}?language=en-US&api_key={tmdb_api_key}"
     #url = f"https://api.themoviedb.org/3/{asset_type}/{movie_id}?language=en-US&api_key=2ed2b9d2e44bf6e9a70b687c134ed8f9"
     response = requests.get(url)
     if response.status_code == 200:
         # Parse JSON response
         data = response.json()
+        
+        # Include watch providers if requested
+        if include_providers:
+            try:
+                from service.watch_providers_job import get_providers_for_asset
+                providers = get_providers_for_asset(movie_id, asset_type, read_from_local=False)
+                data["watch_providers"] = providers
+            except Exception as e:
+                print(f"Error fetching providers for {asset_type} {movie_id}: {e}")
+                data["watch_providers"] = []
+        
         return data
     else:
         print(f"Request failed with status code {response.json()}")

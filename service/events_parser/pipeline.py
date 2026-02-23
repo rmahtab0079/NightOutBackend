@@ -24,6 +24,11 @@ from .firebase_writer import (
     write_curated_events,
 )
 
+# Max keyword searches per cluster (teams + artists combined) to avoid API overload
+MAX_KEYWORDS_PER_CLUSTER = 20
+# Events to fetch per keyword per source
+KEYWORD_SEARCH_SIZE = 25
+
 # Default location (New York City) when a user has no stored location
 _DEFAULT_LAT = 40.7128
 _DEFAULT_LON = -74.0060
@@ -44,7 +49,7 @@ def scrape_all_events(
         latitude, longitude,
         radius_miles=radius_miles,
         days_ahead=days_ahead,
-        size=100,
+        size=150,
     ))
 
     all_events.extend(scrape_eventbrite(
@@ -75,27 +80,32 @@ def _scrape_restaurants_for_user(
         latitude, longitude,
         radius_miles=radius_miles,
         cuisines=cuisines if cuisines else None,
-        max_per_cuisine=8,
+        max_per_cuisine=14,
     )
     restaurants = tag_dietary_matches(restaurants, dietary)
     return restaurants
 
 
 def _dedup(events: list[ScrapedEvent]) -> list[ScrapedEvent]:
-    seen: set[str] = set()
+    seen_ids: set[str] = set()
+    seen_names: set[str] = set()
     deduped: list[ScrapedEvent] = []
     for ev in events:
-        key = f"{ev.source}:{ev.source_id}"
-        if key not in seen:
-            seen.add(key)
-            deduped.append(ev)
+        id_key = f"{ev.source}:{ev.source_id}"
+        name_key = ev.name.strip().lower()
+        if id_key in seen_ids or (name_key and name_key in seen_names):
+            continue
+        seen_ids.add(id_key)
+        if name_key:
+            seen_names.add(name_key)
+        deduped.append(ev)
     return deduped
 
 
 def run_pipeline(
     radius_miles: float = 25.0,
     days_ahead: int = 14,
-    max_events_per_user: int = 50,
+    max_events_per_user: int = 80,
 ) -> dict:
     """
     Full pipeline: scrape events + restaurants, match to all users, write to Firebase.
@@ -154,6 +164,41 @@ def run_pipeline(
         cluster["events"] = shared_events
         total_events += len(shared_events)
 
+        # Collect unique keywords (favorite teams + artists) from all users in cluster
+        keywords_set: set[str] = set()
+        for user in cluster["users"]:
+            for t in user.get("favoriteTeams") or []:
+                if t and isinstance(t, str) and t.strip():
+                    keywords_set.add(t.strip())
+            for a in user.get("favoriteArtists") or []:
+                if a and isinstance(a, str) and a.strip():
+                    keywords_set.add(a.strip())
+        keywords_list = list(keywords_set)[:MAX_KEYWORDS_PER_CLUSTER]
+        keyword_events: list[ScrapedEvent] = []
+        for kw in keywords_list:
+            tm_events = scrape_ticketmaster(
+                cluster["latitude"],
+                cluster["longitude"],
+                radius_miles=radius_miles,
+                days_ahead=days_ahead,
+                size=KEYWORD_SEARCH_SIZE,
+                keyword=kw,
+            )
+            eb_events = scrape_eventbrite(
+                cluster["latitude"],
+                cluster["longitude"],
+                radius_miles=radius_miles,
+                days_ahead=days_ahead,
+                page_size=min(KEYWORD_SEARCH_SIZE, 50),
+                keyword=kw,
+            )
+            keyword_events.extend(tm_events)
+            keyword_events.extend(eb_events)
+        keyword_events = _dedup(keyword_events)
+        total_events += len(keyword_events)
+        if keywords_list:
+            print(f"  Cluster: {len(keywords_list)} keywords -> {len(keyword_events)} extra events")
+
         for user in cluster["users"]:
             email = user.get("email", "")
             if not email:
@@ -162,6 +207,8 @@ def run_pipeline(
             interests = user.get("interests", [])
             cuisines = user.get("cuisines", [])
             dietary = user.get("dietaryPreferences", [])
+            favorite_teams = user.get("favoriteTeams") or []
+            favorite_artists = user.get("favoriteArtists") or []
             user_lat = user.get("last_latitude")
             user_lon = user.get("last_longitude")
 
@@ -174,7 +221,7 @@ def run_pipeline(
             )
             total_restaurants += len(user_restaurants)
 
-            all_items = _dedup(shared_events + user_restaurants)
+            all_items = _dedup(shared_events + keyword_events + user_restaurants)
 
             liked_categories = get_user_swipe_categories(email)
 
@@ -187,6 +234,8 @@ def run_pipeline(
                 user_lon=user_lon,
                 max_radius_miles=radius_miles,
                 liked_categories=liked_categories,
+                user_favorite_teams=favorite_teams,
+                user_favorite_artists=favorite_artists,
                 max_events=max_events_per_user,
             )
 

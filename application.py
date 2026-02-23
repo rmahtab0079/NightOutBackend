@@ -108,6 +108,8 @@ class UserPreferences(BaseModel):
     dietaryPreferences: List[str] = []
     cuisines: List[str] = []
     interests: List[str] = []
+    favoriteTeams: List[str] = []
+    favoriteArtists: List[str] = []
 
 class SearchAssetParams(BaseModel):
     start_year: int = 1970
@@ -1373,6 +1375,158 @@ async def get_user_curated_events(authorization: Optional[str] = Header(default=
         raise HTTPException(status_code=500, detail=str(e))
 
 
+class CuratedPickRequest(BaseModel):
+    category: Optional[str] = None  # sports, music, arts, food, dining, outdoors, other
+    excluded_ids: List[str] = []
+    excluded_names: List[str] = []
+
+
+def _interleave_by_key(items: list[dict], key_fn) -> list[dict]:
+    """
+    Round-robin interleave items by an arbitrary grouping key.
+    Within each group, items retain their original order.
+    """
+    from collections import OrderedDict
+    groups: OrderedDict[str, list[dict]] = OrderedDict()
+    for item in items:
+        k = key_fn(item)
+        groups.setdefault(k, []).append(item)
+
+    result: list[dict] = []
+    while groups:
+        empty_keys = []
+        for k in list(groups.keys()):
+            bucket = groups[k]
+            if bucket:
+                result.append(bucket.pop(0))
+            if not bucket:
+                empty_keys.append(k)
+        for k in empty_keys:
+            del groups[k]
+    return result
+
+
+def _interleave_by_category(events_by_cat: dict) -> list[dict]:
+    """
+    Build a round-robin list that alternates categories so the user
+    sees a diverse mix rather than all Thai restaurants in a row.
+    Each category's items are still ordered by relevance_score internally.
+    """
+    queues: dict[str, list[dict]] = {}
+    for cat, items in events_by_cat.items():
+        sorted_items = sorted(items, key=lambda e: e.get("relevance_score", 0), reverse=True)
+        if sorted_items:
+            queues[cat] = sorted_items
+
+    result: list[dict] = []
+    while queues:
+        empty_cats = []
+        for cat in list(queues.keys()):
+            items = queues[cat]
+            if items:
+                result.append(items.pop(0))
+            if not items:
+                empty_cats.append(cat)
+        for cat in empty_cats:
+            del queues[cat]
+
+    return result
+
+
+@app.post("/curated_event_pick")
+async def curated_event_pick(
+    req: CuratedPickRequest,
+    authorization: Optional[str] = Header(default=None),
+):
+    """
+    Return a single curated event/restaurant for the user, respecting exclusions.
+    Interleaves categories for variety. Deduplicates by both ID and name.
+    """
+    initialize_firebase_if_needed()
+    if firebase_db is None:
+        raise HTTPException(status_code=501, detail="Firebase not configured")
+
+    decoded = _verify_and_get_user(authorization)
+    email = decoded.get("email")
+    if not email:
+        raise HTTPException(status_code=400, detail="Email not found in token")
+
+    try:
+        doc = firebase_db.collection("user_curated_events").document(email).get()
+        if not doc.exists:
+            raise HTTPException(status_code=404, detail="No curated events available")
+
+        data = doc.to_dict()
+        events_by_cat = data.get("events_by_category", {})
+
+        excluded_ids = set(req.excluded_ids)
+        excluded_names = {n.strip().lower() for n in req.excluded_names if n.strip()}
+
+        if req.category:
+            sorted_cat = sorted(
+                events_by_cat.get(req.category, []),
+                key=lambda e: e.get("relevance_score", 0),
+                reverse=True,
+            )
+            candidates = _interleave_by_key(
+                sorted_cat,
+                key_fn=lambda e: (e.get("genre") or e.get("source") or "other").lower(),
+            )
+        else:
+            candidates = _interleave_by_category(events_by_cat)
+
+        seen_names: set[str] = set()
+        for event in candidates:
+            eid = event.get("source_id", event.get("name", ""))
+            ename = (event.get("name") or "").strip().lower()
+
+            if eid in excluded_ids:
+                continue
+            if ename and ename in excluded_names:
+                continue
+            if ename and ename in seen_names:
+                continue
+            seen_names.add(ename)
+            return event
+
+        raise HTTPException(status_code=404, detail="No more curated events")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/curated_categories")
+async def curated_categories(authorization: Optional[str] = Header(default=None)):
+    """Return the available curated categories and their event counts for the user."""
+    initialize_firebase_if_needed()
+    if firebase_db is None:
+        raise HTTPException(status_code=501, detail="Firebase not configured")
+
+    decoded = _verify_and_get_user(authorization)
+    email = decoded.get("email")
+    if not email:
+        raise HTTPException(status_code=400, detail="Email not found in token")
+
+    try:
+        doc = firebase_db.collection("user_curated_events").document(email).get()
+        if not doc.exists:
+            return {"categories": {}, "total_events": 0}
+
+        data = doc.to_dict()
+        events_by_cat = data.get("events_by_category", {})
+        categories = {cat: len(events) for cat, events in events_by_cat.items()}
+        return {
+            "categories": categories,
+            "total_events": sum(categories.values()),
+            "last_updated": data.get("last_updated"),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 class UpdateLocationRequest(BaseModel):
     latitude: float
     longitude: float
@@ -1404,6 +1558,417 @@ async def update_user_location(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------- Friends & Auth Users ----------
+# Firestore: friend_requests (doc id auto), friends/{uid} with map "friends": { friendUid: { addedAt } }
+# Pub/Sub topic for friend request notifications (subscription can send FCM).
+
+FRIEND_REQUESTS_COLLECTION = "friend_requests"
+FRIENDS_COLLECTION = "friends"
+PUBSUB_FRIEND_REQUEST_TOPIC = os.getenv("PUBSUB_FRIEND_REQUEST_TOPIC", "friend-requests")
+
+_pubsub_publisher = None
+
+
+def _get_pubsub_publisher():
+    global _pubsub_publisher
+    if _pubsub_publisher is not None:
+        return _pubsub_publisher
+    try:
+        from google.cloud import pubsub_v1
+        project_id = os.getenv("FIREBASE_PROJECT_ID", os.getenv("GOOGLE_CLOUD_PROJECT"))
+        if project_id:
+            _pubsub_publisher = pubsub_v1.PublisherClient()
+            return _pubsub_publisher
+    except Exception as e:
+        print(f"Pub/Sub publisher init skipped: {e}")
+    return None
+
+
+def _publish_friend_request_notification(to_uid: str, from_uid: str, from_display_name: str, request_id: str) -> None:
+    """Publish a message to the friend-requests topic for push notification delivery."""
+    publisher = _get_pubsub_publisher()
+    if not publisher:
+        return
+    try:
+        import json
+        project_id = os.getenv("FIREBASE_PROJECT_ID", os.getenv("GOOGLE_CLOUD_PROJECT"))
+        if not project_id:
+            return
+        topic_path = publisher.topic_path(project_id, PUBSUB_FRIEND_REQUEST_TOPIC)
+        payload = json.dumps({
+            "to_uid": to_uid,
+            "from_uid": from_uid,
+            "from_display_name": from_display_name or "",
+            "request_id": request_id,
+        }).encode("utf-8")
+        publisher.publish(topic_path, payload)
+    except Exception as e:
+        print(f"Pub/Sub publish failed: {e}")
+
+
+class SendFriendRequestRequest(BaseModel):
+    to_uid: str
+
+
+class RespondFriendRequestRequest(BaseModel):
+    request_id: str
+    accept: bool
+
+
+@app.get("/auth_users")
+async def list_auth_users(
+    authorization: Optional[str] = Header(default=None),
+    page_size: int = 100,
+    page_token: Optional[str] = None,
+):
+    """
+    List Firebase Auth users for the "add friends" flow.
+    Returns uid, email, display_name, photo_url. Excludes current user and users already friends or with pending request.
+    """
+    initialize_firebase_if_needed()
+    decoded = _verify_and_get_user(authorization)
+    current_uid = decoded.get("uid")
+    if not current_uid:
+        raise HTTPException(status_code=400, detail="UID not found in token")
+
+    # First page: pass page_token=None. Firebase Auth rejects empty string.
+    next_token = (page_token or "").strip() or None
+    try:
+        page = firebase_auth.list_users(
+            max_results=min(page_size, 100),
+            page_token=next_token,
+        )
+    except Exception as e:
+        print(f"auth_users list_users error: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to list users: {e}")
+
+    # Load current user's friends and pending (sent + received) to exclude
+    my_friend_uids: Set[str] = set()
+    pending_with: Set[str] = set()
+    if firebase_db:
+        try:
+            friend_doc = firebase_db.collection(FRIENDS_COLLECTION).document(current_uid).get()
+            if friend_doc.exists:
+                friends_map = friend_doc.to_dict().get("friends") or {}
+                my_friend_uids = set(friends_map.keys())
+            # Pending: from_uid or to_uid in friend_requests where status == pending
+            reqs = firebase_db.collection(FRIEND_REQUESTS_COLLECTION).where(
+                "status", "==", "pending"
+            ).stream()
+            for r in reqs:
+                data = r.to_dict()
+                from_uid = data.get("from_uid")
+                to_uid = data.get("to_uid")
+                if from_uid == current_uid:
+                    pending_with.add(to_uid)
+                elif to_uid == current_uid:
+                    pending_with.add(from_uid)
+        except Exception:
+            pass
+
+    exclude_uids = my_friend_uids | pending_with | {current_uid}
+    users = []
+    for user in page.users:
+        if user.uid in exclude_uids:
+            continue
+        users.append({
+            "uid": user.uid,
+            "email": user.email or "",
+            "display_name": (user.display_name or "").strip() or (user.email or "Unknown"),
+            "photo_url": user.photo_url or "",
+        })
+    next_page_token = page.next_page_token if hasattr(page, "next_page_token") else None
+    return {"users": users, "next_page_token": next_page_token}
+
+
+@app.post("/friend_requests")
+async def send_friend_request(
+    req: SendFriendRequestRequest,
+    authorization: Optional[str] = Header(default=None),
+):
+    """Create a pending friend request and publish to Pub/Sub for notification."""
+    initialize_firebase_if_needed()
+    if firebase_db is None:
+        raise HTTPException(status_code=501, detail="Firebase not configured")
+
+    decoded = _verify_and_get_user(authorization)
+    from_uid = decoded.get("uid")
+    from_email = decoded.get("email") or ""
+    from_display_name = (decoded.get("name") or from_email or "Someone").strip()
+    if not from_uid:
+        raise HTTPException(status_code=400, detail="UID not found in token")
+    to_uid = (req.to_uid or "").strip()
+    if not to_uid or to_uid == from_uid:
+        raise HTTPException(status_code=400, detail="Invalid to_uid")
+
+    # Already friends?
+    from_friend_doc = firebase_db.collection(FRIENDS_COLLECTION).document(from_uid).get()
+    if from_friend_doc.exists:
+        friends_map = from_friend_doc.to_dict().get("friends") or {}
+        if to_uid in friends_map:
+            return {"message": "Already friends", "request_id": None}
+
+    # Existing pending request (either direction)?
+    existing = firebase_db.collection(FRIEND_REQUESTS_COLLECTION).where(
+        "from_uid", "==", from_uid
+    ).where("to_uid", "==", to_uid).where("status", "==", "pending").limit(1).stream()
+    for _ in existing:
+        return {"message": "Request already sent", "request_id": None}
+    existing = firebase_db.collection(FRIEND_REQUESTS_COLLECTION).where(
+        "from_uid", "==", to_uid
+    ).where("to_uid", "==", from_uid).where("status", "==", "pending").limit(1).stream()
+    for _ in existing:
+        return {"message": "They already sent you a request", "request_id": None}
+
+    now = datetime.utcnow().isoformat() + "Z"
+    ref = firebase_db.collection(FRIEND_REQUESTS_COLLECTION).document()
+    ref.set({
+        "from_uid": from_uid,
+        "to_uid": to_uid,
+        "status": "pending",
+        "created_at": now,
+        "from_display_name": from_display_name,
+        "from_email": from_email,
+    })
+    request_id = ref.id
+    _publish_friend_request_notification(to_uid, from_uid, from_display_name, request_id)
+    return {"message": "Friend request sent", "request_id": request_id}
+
+
+@app.get("/friend_requests/incoming")
+async def get_incoming_friend_requests(authorization: Optional[str] = Header(default=None)):
+    """List pending friend requests where current user is the recipient."""
+    initialize_firebase_if_needed()
+    if firebase_db is None:
+        raise HTTPException(status_code=501, detail="Firebase not configured")
+
+    decoded = _verify_and_get_user(authorization)
+    to_uid = decoded.get("uid")
+    if not to_uid:
+        raise HTTPException(status_code=400, detail="UID not found in token")
+
+    snapshot = firebase_db.collection(FRIEND_REQUESTS_COLLECTION).where(
+        "to_uid", "==", to_uid
+    ).where("status", "==", "pending").stream()
+    requests = []
+    for doc in snapshot:
+        data = doc.to_dict()
+        data["request_id"] = doc.id
+        requests.append(data)
+    return {"requests": requests}
+
+
+@app.post("/friend_requests/respond")
+async def respond_to_friend_request(
+    req: RespondFriendRequestRequest,
+    authorization: Optional[str] = Header(default=None),
+):
+    """Accept or decline a friend request. On accept, add both users to each other's friends map."""
+    initialize_firebase_if_needed()
+    if firebase_db is None:
+        raise HTTPException(status_code=501, detail="Firebase not configured")
+
+    decoded = _verify_and_get_user(authorization)
+    current_uid = decoded.get("uid")
+    if not current_uid:
+        raise HTTPException(status_code=400, detail="UID not found in token")
+
+    doc_ref = firebase_db.collection(FRIEND_REQUESTS_COLLECTION).document(req.request_id)
+    doc = doc_ref.get()
+    if not doc.exists:
+        raise HTTPException(status_code=404, detail="Request not found")
+    data = doc.to_dict()
+    if data.get("to_uid") != current_uid:
+        raise HTTPException(status_code=403, detail="Not the recipient")
+    if data.get("status") != "pending":
+        return {"message": "Request already handled", "accepted": False}
+
+    status = "accepted" if req.accept else "declined"
+    doc_ref.update({"status": status, "responded_at": datetime.utcnow().isoformat() + "Z"})
+
+    if req.accept:
+        from_uid = data.get("from_uid")
+        to_uid = data.get("to_uid")
+        now = datetime.utcnow().isoformat() + "Z"
+        for uid, other_uid in [(from_uid, to_uid), (to_uid, from_uid)]:
+            friend_ref = firebase_db.collection(FRIENDS_COLLECTION).document(uid)
+            doc = friend_ref.get()
+            friends_map = (doc.to_dict().get("friends") or {}) if doc.exists else {}
+            friends_map[other_uid] = {"addedAt": now}
+            friend_ref.set({"friends": friends_map})
+
+    return {"message": "Accepted" if req.accept else "Declined", "accepted": req.accept}
+
+
+@app.get("/friends")
+async def get_my_friends(authorization: Optional[str] = Header(default=None)):
+    """Return the current user's friends map: { friendUid: { addedAt } }."""
+    initialize_firebase_if_needed()
+    if firebase_db is None:
+        raise HTTPException(status_code=501, detail="Firebase not configured")
+
+    decoded = _verify_and_get_user(authorization)
+    uid = decoded.get("uid")
+    if not uid:
+        raise HTTPException(status_code=400, detail="UID not found in token")
+
+    doc = firebase_db.collection(FRIENDS_COLLECTION).document(uid).get()
+    if not doc.exists:
+        return {"friends": {}}
+    data = doc.to_dict()
+    return {"friends": data.get("friends") or {}}
+
+
+@app.get("/friends/list")
+async def get_friends_list(authorization: Optional[str] = Header(default=None)):
+    """Return list of friends with display names for invite UIs. Each item: { uid, display_name, email }."""
+    initialize_firebase_if_needed()
+    if firebase_db is None:
+        raise HTTPException(status_code=501, detail="Firebase not configured")
+
+    decoded = _verify_and_get_user(authorization)
+    uid = decoded.get("uid")
+    if not uid:
+        raise HTTPException(status_code=400, detail="UID not found in token")
+
+    doc = firebase_db.collection(FRIENDS_COLLECTION).document(uid).get()
+    friends_map = (doc.to_dict().get("friends") or {}) if doc.exists else {}
+    result = []
+    for friend_uid in friends_map:
+        try:
+            user_record = firebase_auth.get_user(friend_uid)
+            result.append({
+                "uid": friend_uid,
+                "display_name": (user_record.display_name or "").strip() or (user_record.email or "Friend"),
+                "email": user_record.email or "",
+            })
+        except Exception:
+            result.append({"uid": friend_uid, "display_name": "Friend", "email": ""})
+    return {"friends": result}
+
+
+# ---------- Planned events (create from event/place/restaurant, invite friends) ----------
+PLANNED_EVENTS_COLLECTION = "planned_events"
+
+
+class CreatePlannedEventRequest(BaseModel):
+    name: str
+    event_date: str  # ISO date or YYYY-MM-DD
+    event_time: str  # HH:MM or HH:MM:SS
+    description: Optional[str] = None
+    venue_name: Optional[str] = None
+    venue_address: Optional[str] = None
+    image_url: Optional[str] = None
+    url: Optional[str] = None
+    source_type: Optional[str] = None  # event | place | restaurant
+    invited_uids: List[str] = []
+
+
+@app.post("/planned_events")
+async def create_planned_event(
+    req: CreatePlannedEventRequest,
+    authorization: Optional[str] = Header(default=None),
+):
+    """Create a planned event and invite friends. Stored in Firestore planned_events."""
+    initialize_firebase_if_needed()
+    if firebase_db is None:
+        raise HTTPException(status_code=501, detail="Firebase not configured")
+
+    decoded = _verify_and_get_user(authorization)
+    created_by_uid = decoded.get("uid")
+    created_by_name = (decoded.get("name") or decoded.get("email") or "Someone").strip()
+    if not created_by_uid:
+        raise HTTPException(status_code=400, detail="UID not found in token")
+
+    invited_uids = [u for u in (req.invited_uids or []) if u and u != created_by_uid]
+    now = datetime.utcnow().isoformat() + "Z"
+    ref = firebase_db.collection(PLANNED_EVENTS_COLLECTION).document()
+    ref.set({
+        "created_by_uid": created_by_uid,
+        "created_by_name": created_by_name,
+        "name": req.name,
+        "event_date": req.event_date,
+        "event_time": req.event_time,
+        "description": req.description,
+        "venue_name": req.venue_name,
+        "venue_address": req.venue_address,
+        "image_url": req.image_url,
+        "url": req.url,
+        "source_type": req.source_type or "event",
+        "invited_uids": invited_uids,
+        "created_at": now,
+    })
+    return {"event_id": ref.id, "message": "Event created"}
+
+
+@app.get("/planned_events")
+async def get_planned_events(authorization: Optional[str] = Header(default=None)):
+    """Return events created by the user and events where the user is invited."""
+    initialize_firebase_if_needed()
+    if firebase_db is None:
+        raise HTTPException(status_code=501, detail="Firebase not configured")
+
+    decoded = _verify_and_get_user(authorization)
+    uid = decoded.get("uid")
+    if not uid:
+        raise HTTPException(status_code=400, detail="UID not found in token")
+
+    created = firebase_db.collection(PLANNED_EVENTS_COLLECTION).where(
+        "created_by_uid", "==", uid
+    ).stream()
+    invited = firebase_db.collection(PLANNED_EVENTS_COLLECTION).where(
+        "invited_uids", "array_contains", uid
+    ).stream()
+    seen_ids = set()
+    events = []
+    for doc in created:
+        if doc.id not in seen_ids:
+            seen_ids.add(doc.id)
+            d = doc.to_dict()
+            d["event_id"] = doc.id
+            d["is_creator"] = True
+            events.append(d)
+    for doc in invited:
+        if doc.id not in seen_ids:
+            seen_ids.add(doc.id)
+            d = doc.to_dict()
+            d["event_id"] = doc.id
+            d["is_creator"] = False
+            events.append(d)
+    events.sort(key=lambda e: (e.get("event_date") or "", e.get("event_time") or ""))
+    return {"events": events}
+
+
+class FCMTokenRequest(BaseModel):
+    token: str
+
+
+FCM_TOKENS_COLLECTION = "user_fcm_tokens"
+
+
+@app.post("/fcm_token")
+async def register_fcm_token(
+    req: FCMTokenRequest,
+    authorization: Optional[str] = Header(default=None),
+):
+    """Register FCM token for the current user (used by Pub/Sub subscriber to send push notifications)."""
+    initialize_firebase_if_needed()
+    if firebase_db is None:
+        raise HTTPException(status_code=501, detail="Firebase not configured")
+
+    decoded = _verify_and_get_user(authorization)
+    uid = decoded.get("uid")
+    if not uid or not (req.token or "").strip():
+        raise HTTPException(status_code=400, detail="UID or token missing")
+
+    token = req.token.strip()
+    firebase_db.collection(FCM_TOKENS_COLLECTION).document(uid).set({
+        "tokens": firestore.ArrayUnion([token]),
+        "updated_at": datetime.utcnow().isoformat() + "Z",
+    }, merge=True)
+    return {"message": "Token registered"}
 
 
 @app.get("/get_movie_suggestion")
@@ -1611,22 +2176,29 @@ async def get_recommended_movie_v2(
     disliked_movie_ids = user_preferences.get("dislikedMovieIds", [])
     excluded_ids = set(disliked_movie_ids) if disliked_movie_ids else None
     
-    # Parse genres from comma-separated string
+    # Parse genres from comma-separated string (optional; when omitted, no genre filter)
     genre_list = None
     if genres:
         try:
-            genre_list = [int(g.strip()) for g in genres.split(",")]
+            genre_list = [int(g.strip()) for g in genres.split(",") if g.strip()]
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid genres format. Use comma-separated integers.")
-    if not genre_list:
-        raise HTTPException(status_code=400, detail="At least one genre is required.")
-    if start_year is None or end_year is None:
-        raise HTTPException(status_code=400, detail="start_year and end_year are required.")
+    
+    # Default year range when not provided (e.g. home screen only sends top_n and offset)
+    _current_year = datetime.now().year
+    if start_year is None:
+        start_year = 1970
+    if end_year is None:
+        end_year = _current_year + 1
     
     try:
-        # Prefer precomputed genre recommendations
+        # Prefer precomputed genre recommendations (only when genres filter is provided)
         email = user_preferences.get("email")
-        precomputed_ids = _get_precomputed_genre_ids(email, "movie", genre_list) if email else []
+        precomputed_ids = (
+            _get_precomputed_genre_ids(email, "movie", genre_list)
+            if (email and genre_list)
+            else []
+        )
 
         if precomputed_ids:
             results = []

@@ -48,6 +48,7 @@ def scrape_ticketmaster(
     days_ahead: int = 14,
     size: int = 50,
     classification: Optional[str] = None,
+    keyword: Optional[str] = None,
 ) -> list[ScrapedEvent]:
     """Fetch upcoming events from the Ticketmaster Discovery API."""
     api_key = os.getenv("TICKETMASTER_API_KEY", "")
@@ -72,6 +73,8 @@ def scrape_ticketmaster(
     }
     if classification:
         params["classificationName"] = classification
+    if keyword and keyword.strip():
+        params["keyword"] = keyword.strip()
 
     try:
         resp = requests.get(

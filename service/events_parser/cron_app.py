@@ -31,7 +31,7 @@ async def run_events_parser(
     authorization: Optional[str] = Header(default=None),
     radius_miles: float = 25.0,
     days_ahead: int = 14,
-    max_events_per_user: int = 50,
+    max_events_per_user: int = 80,
 ):
     """
     Trigger a full EventsParser pipeline run.

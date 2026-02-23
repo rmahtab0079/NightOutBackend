@@ -29,6 +29,7 @@ def scrape_eventbrite(
     radius_miles: float = 25.0,
     days_ahead: int = 14,
     page_size: int = 50,
+    keyword: Optional[str] = None,
 ) -> list[ScrapedEvent]:
     """
     Scrape public events from Eventbrite's search page API.
@@ -62,6 +63,8 @@ def scrape_eventbrite(
         "within": f"{km_radius}km",
         "page": "1",
     }
+    if keyword and keyword.strip():
+        params["q"] = keyword.strip()
 
     try:
         resp = requests.get(search_url, params=params, headers=headers, timeout=15)

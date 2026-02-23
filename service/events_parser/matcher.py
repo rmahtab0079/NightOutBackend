@@ -91,6 +91,22 @@ def _score_restaurant(
     return score
 
 
+def _keyword_match_bonus(
+    event: ScrapedEvent,
+    keywords: list[str],
+    bonus_per_match: float = 1.8,
+) -> float:
+    """Bonus when event name/description contains any of the given keywords (e.g. team or artist)."""
+    if not keywords:
+        return 0.0
+    text = f"{event.name} {event.description or ''}".lower()
+    score = 0.0
+    for kw in keywords:
+        if kw and kw.lower() in text:
+            score += bonus_per_match
+    return score
+
+
 def score_event_for_user(
     event: ScrapedEvent,
     user_interests: list[str],
@@ -100,6 +116,8 @@ def score_event_for_user(
     user_lon: Optional[float] = None,
     max_radius_miles: float = 30.0,
     liked_categories: Optional[set[str]] = None,
+    user_favorite_teams: Optional[list[str]] = None,
+    user_favorite_artists: Optional[list[str]] = None,
 ) -> float:
     """
     Score an event's relevance for a user (0.0 = no match, higher = better).
@@ -134,6 +152,19 @@ def score_event_for_user(
     tag_overlap = event_tags_lower & user_interests_lower
     score += len(tag_overlap) * 1.5
 
+    # Bonus for favorite teams (sports events, games)
+    score += _keyword_match_bonus(
+        event,
+        user_favorite_teams or [],
+        bonus_per_match=1.8,
+    )
+    # Bonus for favorite artists (concerts, music events)
+    score += _keyword_match_bonus(
+        event,
+        user_favorite_artists or [],
+        bonus_per_match=1.8,
+    )
+
     food_tags = {"food", "restaurant", "brunch", "dinner", "drinks", "wine", "coffee", "brewery"}
     if event_tags_lower & food_tags:
         for i, cuisine in enumerate(user_cuisines):
@@ -160,6 +191,8 @@ def match_events_to_user(
     user_lon: Optional[float] = None,
     max_radius_miles: float = 30.0,
     liked_categories: Optional[set[str]] = None,
+    user_favorite_teams: Optional[list[str]] = None,
+    user_favorite_artists: Optional[list[str]] = None,
     min_score: float = 0.3,
     max_events: int = 50,
 ) -> list[tuple[ScrapedEvent, float]]:
@@ -180,6 +213,8 @@ def match_events_to_user(
             user_lon,
             max_radius_miles,
             liked_categories,
+            user_favorite_teams=user_favorite_teams,
+            user_favorite_artists=user_favorite_artists,
         )
         if s >= min_score:
             scored.append((event, s))

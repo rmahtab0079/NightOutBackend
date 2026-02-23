@@ -8,7 +8,7 @@ DOTENV_MOUNT_PATH ?= /var/secrets/.env
 .PHONY: run docker-create docker-build deploy gcp-enable-apis dotenv-secret-create dotenv-upload cloud-run-update-dotenv secret-grant-access
 
 run:
-	uvicorn application:app --host 0.0.0.0 --port 8000
+	uvicorn application:app --host 0.0.0.0 --port 8000 --reload
 
 docker-create:
 	docker buildx create --use --name ar_builder || docker buildx use ar_builder

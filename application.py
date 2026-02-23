@@ -107,6 +107,7 @@ class UserPreferences(BaseModel):
     streamingServices: List[str] = []
     dietaryPreferences: List[str] = []
     cuisines: List[str] = []
+    interests: List[str] = []
 
 class SearchAssetParams(BaseModel):
     start_year: int = 1970
@@ -132,6 +133,35 @@ class UpdatePreferenceRequest(BaseModel):
 class AddAssetRequest(BaseModel):
     asset_type: str  # 'movie' or 'tv'
     asset_id: int  # ID of the movie or TV show
+
+
+class EventSwipe(BaseModel):
+    event_id: str
+    name: str
+    liked: bool
+    segment: Optional[str] = None
+    genre: Optional[str] = None
+    venue_name: Optional[str] = None
+    min_price: Optional[float] = None
+    max_price: Optional[float] = None
+    date: Optional[str] = None
+
+
+class EventSwipeBatch(BaseModel):
+    swipes: List[EventSwipe]
+
+
+class PlaceSwipe(BaseModel):
+    name: str
+    liked: bool
+    place_type: Optional[str] = None
+    address: Optional[str] = None
+    rating: Optional[float] = None
+    price_level: Optional[int] = None
+
+
+class PlaceSwipeBatch(BaseModel):
+    swipes: List[PlaceSwipe]
 
 
 class RecomputeGenreRecsRequest(BaseModel):
@@ -284,6 +314,7 @@ class NightOutSuggestionRequest(BaseModel):
     radius_meters: float = 10000.0
     dietary_preferences: List[str] = []
     cuisines: List[str] = []
+    interests: List[str] = []
     excluded_names: List[str] = []
 
 
@@ -311,6 +342,8 @@ class NightOutEventRequest(BaseModel):
     longitude: float
     radius_miles: float = 10.0
     classification: Optional[str] = None
+    keyword: Optional[str] = None
+    interests: List[str] = []
     start_date: Optional[str] = None
     end_date: Optional[str] = None
     excluded_event_ids: List[str] = []
@@ -358,6 +391,7 @@ def search_nearby_events(
     longitude: float,
     radius_miles: float = 10.0,
     classification: Optional[str] = None,
+    keyword: Optional[str] = None,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     size: int = 20,
@@ -377,6 +411,8 @@ def search_nearby_events(
 
     if classification:
         params["classificationName"] = classification
+    if keyword:
+        params["keyword"] = keyword
     if start_date:
         params["startDateTime"] = start_date
     if end_date:
@@ -439,9 +475,16 @@ def search_nearby_events(
                 segment = c.get("segment", {}).get("name")
                 genre = c.get("genre", {}).get("name")
 
+            description = (
+                event.get("info")
+                or event.get("description")
+                or event.get("pleaseNote")
+            )
+
             results.append({
                 "id": event.get("id"),
                 "name": event.get("name"),
+                "description": description,
                 "image_url": image_url,
                 "date": date_str,
                 "time": time_str,
@@ -467,6 +510,14 @@ async def get_night_out_events(req: NightOutEventRequest):
     excluded = set(req.excluded_event_ids)
     max_event_price = BUDGET_TO_MAX_EVENT_PRICE.get(req.budget)
 
+    classification = req.classification
+    keyword = req.keyword
+
+    if not classification and not keyword and req.interests:
+        personalized = _personalized_event_params(req.interests)
+        classification = personalized.get("classification")
+        keyword = personalized.get("keyword")
+
     from datetime import timedelta
     today = datetime.utcnow()
     default_start = req.start_date or today.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -480,7 +531,8 @@ async def get_night_out_events(req: NightOutEventRequest):
             latitude=req.latitude,
             longitude=req.longitude,
             radius_miles=current_radius,
-            classification=req.classification,
+            classification=classification,
+            keyword=keyword,
             start_date=default_start,
             end_date=default_end,
         )
@@ -508,6 +560,44 @@ async def get_night_out_events(req: NightOutEventRequest):
     raise HTTPException(status_code=404, detail="No events found nearby")
 
 
+@app.post("/nearby_events_batch")
+async def get_nearby_events_batch(req: NightOutEventRequest):
+    from datetime import timedelta
+    today = datetime.utcnow()
+    default_start = req.start_date or today.strftime("%Y-%m-%dT%H:%M:%SZ")
+    default_end = req.end_date or (today + timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    events = search_nearby_events(
+        latitude=req.latitude,
+        longitude=req.longitude,
+        radius_miles=req.radius_miles,
+        classification=req.classification,
+        keyword=req.keyword,
+        start_date=default_start,
+        end_date=default_end,
+        size=20,
+    )
+
+    excluded = set(req.excluded_event_ids)
+    if excluded:
+        events = [e for e in events if e["id"] not in excluded]
+
+    return {"events": events}
+
+
+class NearbyPlacesBatchRequest(BaseModel):
+    latitude: float
+    longitude: float
+    radius_meters: float = 16093.4  # ~10 miles
+
+
+@app.post("/nearby_places_batch")
+async def get_nearby_places_batch(req: NearbyPlacesBatchRequest):
+    location = LocationData(latitude=req.latitude, longitude=req.longitude)
+    places = search_nearby_places(location, radius=req.radius_meters)
+    return {"places": places}
+
+
 @app.get("/event_classifications")
 def event_classifications():
     return [
@@ -517,6 +607,28 @@ def event_classifications():
         {"id": "film", "name": "Film"},
         {"id": "miscellaneous", "name": "Other"},
     ]
+
+
+@app.get("/interest_options")
+def interest_options():
+    return {
+        "Sports & Fitness": [
+            "Soccer", "Basketball", "Volleyball", "Tennis", "Golf",
+            "Swimming", "Running", "Cycling", "Yoga", "Boxing", "Bowling",
+        ],
+        "Music & Entertainment": [
+            "Live Music", "Comedy Shows", "Theater", "Dance Clubs", "Karaoke",
+        ],
+        "Arts & Culture": [
+            "Art Galleries", "Museums", "Film Festivals",
+        ],
+        "Food & Drink": [
+            "Wine Tasting", "Cooking Classes", "Brewery Tours", "Coffee Culture",
+        ],
+        "Outdoors & Adventure": [
+            "Hiking", "Rock Climbing", "Kayaking", "Fishing", "Camping",
+        ],
+    }
 
 
 def _get_tmdb_youtube_trailer(asset_id: int, asset_type: str) -> Optional[str]:
@@ -681,16 +793,95 @@ CUISINE_TO_PLACE_TYPES = {
     "Middle Eastern": ["middle_eastern_restaurant"],
 }
 
+INTEREST_TO_PLACE_TYPES: dict[str, list[str]] = {
+    "Soccer": ["sports_complex"],
+    "Basketball": ["sports_complex"],
+    "Volleyball": ["sports_complex"],
+    "Tennis": ["sports_complex"],
+    "Golf": ["golf_course"],
+    "Swimming": ["swimming_pool"],
+    "Running": ["park"],
+    "Cycling": ["park"],
+    "Yoga": ["yoga_studio"],
+    "Boxing": ["gym"],
+    "Bowling": ["bowling_alley"],
+    "Live Music": ["night_club", "bar"],
+    "Comedy Shows": ["performing_arts_theater"],
+    "Theater": ["performing_arts_theater"],
+    "Dance Clubs": ["night_club"],
+    "Karaoke": ["bar", "night_club"],
+    "Art Galleries": ["art_gallery"],
+    "Museums": ["museum"],
+    "Film Festivals": ["movie_theater"],
+    "Wine Tasting": ["wine_bar"],
+    "Cooking Classes": ["restaurant"],
+    "Brewery Tours": ["bar"],
+    "Coffee Culture": ["cafe"],
+    "Hiking": ["national_park", "park"],
+    "Rock Climbing": ["gym", "sports_complex"],
+    "Kayaking": ["park"],
+    "Fishing": ["park"],
+    "Camping": ["national_park", "park"],
+}
+
+INTEREST_TO_TM_PARAMS: dict[str, dict[str, str]] = {
+    "Soccer": {"classification": "sports", "keyword": "soccer"},
+    "Basketball": {"classification": "sports", "keyword": "basketball"},
+    "Volleyball": {"classification": "sports", "keyword": "volleyball"},
+    "Tennis": {"classification": "sports", "keyword": "tennis"},
+    "Golf": {"classification": "sports", "keyword": "golf"},
+    "Swimming": {"classification": "sports", "keyword": "swimming"},
+    "Running": {"classification": "sports", "keyword": "marathon running"},
+    "Cycling": {"classification": "sports", "keyword": "cycling"},
+    "Yoga": {"classification": "miscellaneous", "keyword": "yoga"},
+    "Boxing": {"classification": "sports", "keyword": "boxing"},
+    "Bowling": {"classification": "sports", "keyword": "bowling"},
+    "Live Music": {"classification": "music"},
+    "Comedy Shows": {"classification": "arts", "keyword": "comedy"},
+    "Theater": {"classification": "arts", "keyword": "theatre"},
+    "Dance Clubs": {"classification": "music", "keyword": "DJ dance"},
+    "Karaoke": {"classification": "music", "keyword": "karaoke"},
+    "Art Galleries": {"classification": "arts", "keyword": "art exhibition"},
+    "Museums": {"classification": "arts", "keyword": "museum exhibit"},
+    "Film Festivals": {"classification": "film", "keyword": "film festival"},
+    "Wine Tasting": {"classification": "miscellaneous", "keyword": "wine tasting"},
+    "Cooking Classes": {"classification": "miscellaneous", "keyword": "cooking"},
+    "Brewery Tours": {"classification": "miscellaneous", "keyword": "brewery"},
+    "Coffee Culture": {"classification": "miscellaneous", "keyword": "coffee"},
+    "Hiking": {"classification": "miscellaneous", "keyword": "hiking outdoor"},
+    "Rock Climbing": {"classification": "sports", "keyword": "climbing"},
+    "Kayaking": {"classification": "sports", "keyword": "kayak"},
+    "Fishing": {"classification": "sports", "keyword": "fishing"},
+    "Camping": {"classification": "miscellaneous", "keyword": "camping outdoor"},
+}
+
+
+def _personalized_place_types(
+    cuisines: List[str],
+    interests: List[str],
+) -> list[str]:
+    types: list[str] = []
+    for c in cuisines:
+        types.extend(CUISINE_TO_PLACE_TYPES.get(c, []))
+    for i in interests:
+        types.extend(INTEREST_TO_PLACE_TYPES.get(i, []))
+    return list(dict.fromkeys(types)) if types else list(places_of_interest)
+
+
+def _personalized_event_params(interests: List[str]) -> dict[str, str | None]:
+    if not interests:
+        return {"classification": None, "keyword": None}
+    pick = random.choice(interests)
+    params = INTEREST_TO_TM_PARAMS.get(pick, {})
+    return {
+        "classification": params.get("classification"),
+        "keyword": params.get("keyword"),
+    }
+
 
 @app.post("/night_out_suggestion")
 async def get_night_out_suggestion(req: NightOutSuggestionRequest):
-    included_types = list(places_of_interest)
-    if req.cuisines:
-        cuisine_types = []
-        for c in req.cuisines:
-            cuisine_types.extend(CUISINE_TO_PLACE_TYPES.get(c, []))
-        if cuisine_types:
-            included_types = cuisine_types
+    included_types = _personalized_place_types(req.cuisines, req.interests)
 
     location = LocationData(latitude=req.latitude, longitude=req.longitude)
     excluded = set(req.excluded_names)
@@ -941,6 +1132,191 @@ async def add_disliked_asset(payload: AddAssetRequest, authorization: Optional[s
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/user_preferences/event_swipes")
+async def save_event_swipes(batch: EventSwipeBatch, authorization: Optional[str] = Header(default=None)):
+    initialize_firebase_if_needed()
+    if firebase_db is None:
+        raise HTTPException(status_code=501, detail="Firebase not configured")
+
+    decoded = _verify_and_get_user(authorization)
+    email = decoded.get("email")
+    if not email:
+        raise HTTPException(status_code=400, detail="Email not found in token")
+
+    try:
+        collection = firebase_db.collection("user_event_swipes")
+        doc_ref = collection.document(email)
+        doc = doc_ref.get()
+
+        liked_events: list[dict] = []
+        disliked_events: list[dict] = []
+
+        for swipe in batch.swipes:
+            entry = {
+                "event_id": swipe.event_id,
+                "name": swipe.name,
+                "segment": swipe.segment,
+                "genre": swipe.genre,
+                "venue_name": swipe.venue_name,
+                "min_price": swipe.min_price,
+                "max_price": swipe.max_price,
+                "date": swipe.date,
+                "swiped_at": datetime.utcnow().isoformat() + "Z",
+            }
+            if swipe.liked:
+                liked_events.append(entry)
+            else:
+                disliked_events.append(entry)
+
+        if doc.exists:
+            updates: dict = {}
+            if liked_events:
+                updates["likedEvents"] = firestore.ArrayUnion(liked_events)
+            if disliked_events:
+                updates["dislikedEvents"] = firestore.ArrayUnion(disliked_events)
+            if updates:
+                doc_ref.update(updates)
+        else:
+            doc_ref.set({
+                "email": email,
+                "likedEvents": liked_events,
+                "dislikedEvents": disliked_events,
+                "createdAt": datetime.utcnow().isoformat() + "Z",
+            })
+
+        return {
+            "message": "Event swipes saved",
+            "liked_count": len(liked_events),
+            "disliked_count": len(disliked_events),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/user_event_history")
+async def get_user_event_history(authorization: Optional[str] = Header(default=None)):
+    initialize_firebase_if_needed()
+    if firebase_db is None:
+        raise HTTPException(status_code=501, detail="Firebase not configured")
+
+    decoded = _verify_and_get_user(authorization)
+    email = decoded.get("email")
+    if not email:
+        raise HTTPException(status_code=400, detail="Email not found in token")
+
+    try:
+        doc = firebase_db.collection("user_event_swipes").document(email).get()
+        if not doc.exists:
+            return {"seen_event_ids": [], "liked_event_ids": []}
+
+        data = doc.to_dict()
+        liked_ids = [e["event_id"] for e in data.get("likedEvents", [])]
+        disliked_ids = [e["event_id"] for e in data.get("dislikedEvents", [])]
+        return {
+            "seen_event_ids": liked_ids + disliked_ids,
+            "liked_event_ids": liked_ids,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/user_preferences/place_swipes")
+async def save_place_swipes(batch: PlaceSwipeBatch, authorization: Optional[str] = Header(default=None)):
+    initialize_firebase_if_needed()
+    if firebase_db is None:
+        raise HTTPException(status_code=501, detail="Firebase not configured")
+
+    decoded = _verify_and_get_user(authorization)
+    email = decoded.get("email")
+    if not email:
+        raise HTTPException(status_code=400, detail="Email not found in token")
+
+    try:
+        collection = firebase_db.collection("user_place_swipes")
+        doc_ref = collection.document(email)
+        doc = doc_ref.get()
+
+        liked_places: list[dict] = []
+        disliked_places: list[dict] = []
+
+        for swipe in batch.swipes:
+            entry = {
+                "name": swipe.name,
+                "place_type": swipe.place_type,
+                "address": swipe.address,
+                "rating": swipe.rating,
+                "price_level": swipe.price_level,
+                "swiped_at": datetime.utcnow().isoformat() + "Z",
+            }
+            if swipe.liked:
+                liked_places.append(entry)
+            else:
+                disliked_places.append(entry)
+
+        if doc.exists:
+            updates: dict = {}
+            if liked_places:
+                updates["likedPlaces"] = firestore.ArrayUnion(liked_places)
+            if disliked_places:
+                updates["dislikedPlaces"] = firestore.ArrayUnion(disliked_places)
+            if updates:
+                doc_ref.update(updates)
+        else:
+            doc_ref.set({
+                "email": email,
+                "likedPlaces": liked_places,
+                "dislikedPlaces": disliked_places,
+                "createdAt": datetime.utcnow().isoformat() + "Z",
+            })
+
+        return {
+            "message": "Place swipes saved",
+            "liked_count": len(liked_places),
+            "disliked_count": len(disliked_places),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/user_place_history")
+async def get_user_place_history(authorization: Optional[str] = Header(default=None)):
+    initialize_firebase_if_needed()
+    if firebase_db is None:
+        raise HTTPException(status_code=501, detail="Firebase not configured")
+
+    decoded = _verify_and_get_user(authorization)
+    email = decoded.get("email")
+    if not email:
+        raise HTTPException(status_code=400, detail="Email not found in token")
+
+    try:
+        doc = firebase_db.collection("user_place_swipes").document(email).get()
+        if not doc.exists:
+            return {"seen_place_names": [], "liked_place_names": []}
+
+        data = doc.to_dict()
+        liked = [p["name"] for p in data.get("likedPlaces", [])]
+        disliked = [p["name"] for p in data.get("dislikedPlaces", [])]
+        return {
+            "seen_place_names": liked + disliked,
+            "liked_place_names": liked,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/user_preferences")
 async def submit_user_preferences(preferences: UserPreferences, authorization: Optional[str] = Header(default=None)):
     initialize_firebase_if_needed()
@@ -971,6 +1347,62 @@ async def submit_user_preferences(preferences: UserPreferences, authorization: O
         return {"message": "User preferences submitted", "documentId": doc_ref.id}
     except Exception as e:
         print(e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/user_curated_events")
+async def get_user_curated_events(authorization: Optional[str] = Header(default=None)):
+    """Return the curated events for the authenticated user."""
+    initialize_firebase_if_needed()
+    if firebase_db is None:
+        raise HTTPException(status_code=501, detail="Firebase not configured")
+
+    decoded = _verify_and_get_user(authorization)
+    email = decoded.get("email")
+    if not email:
+        raise HTTPException(status_code=400, detail="Email not found in token")
+
+    try:
+        doc = firebase_db.collection("user_curated_events").document(email).get()
+        if not doc.exists:
+            return {"events_by_category": {}, "total_events": 0}
+        return doc.to_dict()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class UpdateLocationRequest(BaseModel):
+    latitude: float
+    longitude: float
+
+
+@app.post("/user_preferences/location")
+async def update_user_location(
+    req: UpdateLocationRequest,
+    authorization: Optional[str] = Header(default=None),
+):
+    """Store the user's last known location for background event curation."""
+    initialize_firebase_if_needed()
+    if firebase_db is None:
+        raise HTTPException(status_code=501, detail="Firebase not configured")
+
+    decoded = _verify_and_get_user(authorization)
+    email = decoded.get("email")
+    if not email:
+        raise HTTPException(status_code=400, detail="Email not found in token")
+
+    try:
+        firebase_db.collection("user_preferences").document(email).update({
+            "last_latitude": req.latitude,
+            "last_longitude": req.longitude,
+            "location_updated_at": datetime.utcnow().isoformat() + "Z",
+        })
+        return {"message": "Location updated"}
+    except HTTPException:
+        raise
+    except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 

@@ -68,3 +68,56 @@ secret-grant-access:
 
 ngrok:
 	ngrok http http://localhost:8000
+
+# ---- EventsParser Cron Job ----
+EVENTS_PARSER_IMAGE := us-east1-docker.pkg.dev/$(PROJECT)/containers/events-parser:latest
+EVENTS_PARSER_SERVICE := events-parser
+
+events-parser-run-local:
+	python -m service.events_parser.cron_app
+
+events-parser-docker-build:
+	docker buildx build --platform linux/amd64 \
+		-f Dockerfile.events_parser \
+		-t $(EVENTS_PARSER_IMAGE) --push .
+
+events-parser-deploy:
+	gcloud run deploy $(EVENTS_PARSER_SERVICE) \
+		--project $(PROJECT) \
+		--region $(REGION) \
+		--image $(EVENTS_PARSER_IMAGE) \
+		--no-allow-unauthenticated \
+		--set-secrets=$(DOTENV_MOUNT_PATH)=$(DOTENV_SECRET):latest \
+		--update-env-vars DOTENV_PATH=$(DOTENV_MOUNT_PATH) \
+		--cpu 1 \
+		--memory 512Mi \
+		--max-instances 1 \
+		--timeout 300 \
+		--quiet
+	@echo "Events parser deployed."
+
+events-parser-create-scheduler:
+	@echo "Creating Cloud Scheduler job to trigger events parser every 6 hours..."
+	@SERVICE_URL=$$(gcloud run services describe $(EVENTS_PARSER_SERVICE) \
+		--project $(PROJECT) --region $(REGION) --format='value(status.url)'); \
+	SA_EMAIL=$$(gcloud projects describe $(PROJECT) --format='value(projectNumber)'); \
+	SA_EMAIL="$$SA_EMAIL-compute@developer.gserviceaccount.com"; \
+	gcloud scheduler jobs create http events-parser-cron \
+		--project $(PROJECT) \
+		--location $(REGION) \
+		--schedule "0 */6 * * *" \
+		--uri "$$SERVICE_URL/run_events_parser" \
+		--http-method POST \
+		--oidc-service-account-email "$$SA_EMAIL" \
+		--oidc-token-audience "$$SERVICE_URL" \
+		--time-zone "America/New_York" \
+		--attempt-deadline 300s \
+		--quiet
+	@echo "Scheduler created: runs every 6 hours."
+
+events-parser-trigger:
+	@SERVICE_URL=$$(gcloud run services describe $(EVENTS_PARSER_SERVICE) \
+		--project $(PROJECT) --region $(REGION) --format='value(status.url)'); \
+	curl -X POST "$$SERVICE_URL/run_events_parser" \
+		-H "Authorization: Bearer $$(gcloud auth print-identity-token)" \
+		-H "Content-Type: application/json"

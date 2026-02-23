@@ -45,7 +45,7 @@ DIETARY_KEYWORDS: dict[str, list[str]] = {
 def scrape_restaurants(
     latitude: float,
     longitude: float,
-    radius_miles: float = 15.0,
+    radius_miles: float = 50.0,
     cuisines: Optional[list[str]] = None,
     max_per_cuisine: int = 10,
 ) -> list[ScrapedEvent]:

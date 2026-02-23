@@ -223,26 +223,26 @@ def match_events_to_user(
     return scored[:max_events]
 
 
+# Only these sources are real dining/places; others must not go in "food".
+_DINING_SOURCES = frozenset({"google_places"})
+
+
 def group_events_by_category(
     matched: list[tuple[ScrapedEvent, float]],
 ) -> dict[str, list[dict]]:
     """
     Group matched events by their category tag.
 
-    Returns a dict like:
-      {
-        "sports": [...],
-        "music": [...],
-        "arts": [...],
-        "food": [...],
-        "dining": [...],
-        "outdoors": [...],
-        "other": [...],
-      }
+    The "food" key is reserved for real dining/places only (Google Places).
+    Events from Ticketmaster/Eventbrite/Partiful that were tagged "food" are
+    grouped under "other" so the Food tab never shows theatre/entertainment.
     """
     groups: dict[str, list[dict]] = {}
     for event, score in matched:
         cat = event.category or "other"
+        # Prevent entertainment events from appearing under "food"
+        if cat == "food" and event.source not in _DINING_SOURCES:
+            cat = "other"
         entry = event.to_dict()
         entry["relevance_score"] = round(score, 2)
         groups.setdefault(cat, []).append(entry)

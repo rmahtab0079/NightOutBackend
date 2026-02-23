@@ -37,7 +37,7 @@ _DEFAULT_LON = -74.0060
 def scrape_all_events(
     latitude: float,
     longitude: float,
-    radius_miles: float = 25.0,
+    radius_miles: float = 50.0,
     days_ahead: int = 14,
 ) -> list[ScrapedEvent]:
     """Run all non-personalized scrapers for a given geographic center."""
@@ -75,7 +75,7 @@ def _scrape_restaurants_for_user(
     cuisines: list[str],
     dietary: list[str],
 ) -> list[ScrapedEvent]:
-    """Scrape restaurants personalized to a specific user's cuisine rankings."""
+    """Scrape restaurants from Google Places (50-mile radius by default), then tag dietary."""
     restaurants = scrape_restaurants(
         latitude, longitude,
         radius_miles=radius_miles,
@@ -103,7 +103,7 @@ def _dedup(events: list[ScrapedEvent]) -> list[ScrapedEvent]:
 
 
 def run_pipeline(
-    radius_miles: float = 25.0,
+    radius_miles: float = 50.0,
     days_ahead: int = 14,
     max_events_per_user: int = 80,
 ) -> dict:

@@ -73,6 +73,15 @@ ngrok:
 EVENTS_PARSER_IMAGE := us-east1-docker.pkg.dev/$(PROJECT)/containers/events-parser:latest
 EVENTS_PARSER_SERVICE := events-parser
 
+# Clear user_curated_events in Firebase (removes wrong food/events), then optionally rerun pipeline.
+# Use after fixing pipeline bugs so the app shows correct data.
+events-parser-clear-curated:
+	python scripts/clear_curated_events_and_rerun.py
+
+# Clear curated events and run the pipeline locally (50 mi radius, 14 days).
+events-parser-clear-and-rerun:
+	python scripts/clear_curated_events_and_rerun.py --rerun --radius 50 --days 14
+
 events-parser-run-local:
 	python -m service.events_parser.cron_app
 

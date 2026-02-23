@@ -67,7 +67,7 @@ def scrape_ticketmaster(
         "radius": str(int(max(radius_miles, 1))),
         "unit": "miles",
         "size": str(min(size, 200)),
-        "sort": "date,asc",
+        "sort": "relevance,desc",
         "startDateTime": start,
         "endDateTime": end,
     }
@@ -133,6 +133,11 @@ def scrape_ticketmaster(
                 c = classifications[0]
                 segment = c.get("segment", {}).get("name")
                 genre = c.get("genre", {}).get("name")
+                # Don't store "Undefined" from API — treat as missing
+                if segment and str(segment).strip().lower() == "undefined":
+                    segment = None
+                if genre and str(genre).strip().lower() == "undefined":
+                    genre = None
                 if segment:
                     tags.append(segment.lower())
                 if genre:

@@ -60,7 +60,7 @@ CLASSIFICATION_TO_CATEGORY: dict[str, str] = {
     "arts": "arts",
     "arts & theatre": "arts",
     "film": "arts",
-    "miscellaneous": "food",
+    "miscellaneous": "other",
     "comedy": "arts",
     "theatre": "arts",
     "dance": "music",

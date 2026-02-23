@@ -96,6 +96,37 @@ def get_user_swipe_categories(email: str) -> set[str]:
     return liked_categories
 
 
+# Collection for storing parsed events by composite id (source:source_id) for lookup by id
+PARSED_EVENTS_CATALOG_COLLECTION = "parsed_events_catalog"
+
+
+def _event_catalog_id(event: dict) -> str | None:
+    """Generate a stable document id for the event catalog (source:source_id)."""
+    source = (event.get("source") or "").strip()
+    source_id = (event.get("source_id") or event.get("name") or "").strip()
+    if not source or not source_id:
+        return None
+    return f"{source}:{source_id}"
+
+
+def write_parsed_events_to_catalog(events: list[dict]) -> None:
+    """
+    Upsert parsed events into the parsed_events_catalog collection.
+    Each document id = source:source_id; body = full event dict + last_updated.
+    """
+    db = _get_db()
+    coll = db.collection(PARSED_EVENTS_CATALOG_COLLECTION)
+    now = datetime.utcnow().isoformat() + "Z"
+    for event in events:
+        doc_id = _event_catalog_id(event)
+        if not doc_id:
+            continue
+        payload = {**event, "last_updated": now}
+        coll.document(doc_id).set(payload)
+    if events:
+        print(f"  [firebase] Wrote {len(events)} events to {PARSED_EVENTS_CATALOG_COLLECTION}")
+
+
 def write_curated_events(
     email: str,
     grouped_events: dict[str, list[dict]],
@@ -103,6 +134,7 @@ def write_curated_events(
 ) -> None:
     """
     Write curated events to the user_curated_events collection in Firebase.
+    Also upserts each event into parsed_events_catalog for lookup by id.
 
     Document structure (keyed by email):
     {
@@ -132,6 +164,12 @@ def write_curated_events(
         "total_events": total,
     })
 
+    # Store each parsed event in the catalog table for lookup by id
+    all_events: list[dict] = []
+    for event_list in grouped_events.values():
+        all_events.extend(event_list)
+    write_parsed_events_to_catalog(all_events)
+
     print(f"  [firebase] Wrote {total} curated events for {email}")
 
 
@@ -143,3 +181,21 @@ def update_user_location(email: str, latitude: float, longitude: float) -> None:
         "last_longitude": longitude,
         "location_updated_at": datetime.utcnow().isoformat() + "Z",
     })
+
+
+def clear_user_curated_events() -> int:
+    """
+    Delete all documents in user_curated_events so the next pipeline run
+    repopulates with correct data. Use after fixing pipeline bugs (e.g. wrong
+    events in food category).
+    Returns the number of documents deleted.
+    """
+    db = _get_db()
+    coll = db.collection("user_curated_events")
+    deleted = 0
+    for doc in coll.stream():
+        doc.reference.delete()
+        deleted += 1
+    if deleted:
+        print(f"  [firebase] Deleted {deleted} documents from user_curated_events")
+    return deleted

@@ -309,7 +309,7 @@ class NightInSuggestionRequest(BaseModel):
 
 
 class NightOutSuggestionRequest(BaseModel):
-    party_size: int
+    party_size: int = 1
     budget: Optional[str] = None
     latitude: float
     longitude: float
@@ -1375,6 +1375,28 @@ async def get_user_curated_events(authorization: Optional[str] = Header(default=
         raise HTTPException(status_code=500, detail=str(e))
 
 
+PARSED_EVENTS_CATALOG_COLLECTION = "parsed_events_catalog"
+
+
+@app.get("/event_catalog/{catalog_id:path}")
+async def get_event_from_catalog(
+    catalog_id: str,
+    authorization: Optional[str] = Header(default=None),
+):
+    """
+    Return a single parsed event from the catalog by id (source:source_id).
+    Events are written to this table by the events parser pipeline.
+    """
+    initialize_firebase_if_needed()
+    if firebase_db is None:
+        raise HTTPException(status_code=501, detail="Firebase not configured")
+    _verify_and_get_user(authorization)
+    doc = firebase_db.collection(PARSED_EVENTS_CATALOG_COLLECTION).document(catalog_id).get()
+    if not doc.exists:
+        raise HTTPException(status_code=404, detail="Event not found in catalog")
+    return doc.to_dict()
+
+
 class CuratedPickRequest(BaseModel):
     category: Optional[str] = None  # sports, music, arts, food, dining, outdoors, other
     excluded_ids: List[str] = []
@@ -2221,11 +2243,14 @@ async def get_recommended_movie_v2(
                 if skipped < offset:
                     skipped += 1
                     continue
+                # Normalize so client gets top-level id (Movie.fromJson expects id or movie_id + detail)
                 results.append({
                     "movie_id": movie_id,
+                    "id": movie_id,
                     "title": detail.get("title") or detail.get("original_title"),
                     "similarity": max(0.0, 1.0 - (idx / max(len(precomputed_ids), 1))),
                     "detail": detail,
+                    **{k: v for k, v in detail.items() if v is not None},
                 })
                 if len(results) >= top_n:
                     break

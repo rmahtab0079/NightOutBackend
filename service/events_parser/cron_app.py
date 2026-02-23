@@ -29,7 +29,7 @@ def health():
 @app.post("/run_events_parser")
 async def run_events_parser(
     authorization: Optional[str] = Header(default=None),
-    radius_miles: float = 25.0,
+    radius_miles: float = 50.0,
     days_ahead: int = 14,
     max_events_per_user: int = 80,
 ):
@@ -64,7 +64,7 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(description="Run EventsParser pipeline")
-    parser.add_argument("--radius", type=float, default=25.0, help="Search radius in miles")
+    parser.add_argument("--radius", type=float, default=50.0, help="Search radius in miles")
     parser.add_argument("--days", type=int, default=14, help="Days ahead to search")
     parser.add_argument("--max-events", type=int, default=50, help="Max events per user")
     args = parser.parse_args()

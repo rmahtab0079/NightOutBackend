@@ -122,8 +122,8 @@ def get_assets(
 
 
 def get_assets_page(api_key, page, results_queue, asset_type: str):
-    base_image_url = os.getenv("BASE_IMAGE_URL")
-    default_image_size = os.getenv("DEFAULT_IMAGE_SIZE")
+    base_image_url = os.getenv("BASE_IMAGE_URL") or BASE_IMAGE_URL
+    default_image_size = os.getenv("DEFAULT_IMAGE_SIZE") or DEFAULT_IMAGE_SIZE
     url = f"https://api.themoviedb.org/3/{asset_type}/top_rated?language=en-US&page={page}&api_key={api_key}"
     #url = f"https://api.themoviedb.org/3/discover/movie?include_adult=false&include_video=false&language=en-US&page=1&sort_by=popularity.desc&api_key={tmdb_api_key}"
     response = requests.get(url)

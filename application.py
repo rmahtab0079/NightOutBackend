@@ -71,6 +71,9 @@ if os.getenv("ENABLE_GENRE_RECS_JOB", "true").lower() == "true":
         start_genre_recommendation_scheduler(interval_seconds=300)
 
 api_key = "AIzaSyDW0X1gO6uVSPkYIa3R6sjRwNQrz-afYU0"
+ticketmaster_api_key = os.getenv("TICKETMASTER_API_KEY", "")
+tmdb_api_key = os.getenv("TMDB_API_KEY", "")
+watchmode_api_key = os.getenv("WATCHMODE_API_KEY", "")
 
 places_of_interest = ["hiking_area", "restaurant", "bar", "cafe", "coffee_shop", "beach",
                       "historical_landmark", "movie_theater", "video_arcade", "karaoke", "night_club", "opera_house",
@@ -292,6 +295,319 @@ BUDGET_TO_MAX_PRICE_LEVEL = {
     "$100+": 4,
 }
 
+BUDGET_TO_MAX_EVENT_PRICE = {
+    "Free": 0.0,
+    "Under $20": 20.0,
+    "Under $50": 50.0,
+    "Under $100": 100.0,
+    "$100+": None,
+}
+
+
+class NightOutEventRequest(BaseModel):
+    party_size: int
+    budget: Optional[str] = None
+    latitude: float
+    longitude: float
+    radius_miles: float = 10.0
+    classification: Optional[str] = None
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    excluded_event_ids: List[str] = []
+
+
+def _encode_geohash(lat: float, lng: float, precision: int = 9) -> str:
+    BASE32 = "0123456789bcdefghjkmnpqrstuvwxyz"
+    lat_range = [-90.0, 90.0]
+    lng_range = [-180.0, 180.0]
+    is_lng = True
+    bits = 0
+    char_idx = 0
+    geohash: list[str] = []
+
+    while len(geohash) < precision:
+        if is_lng:
+            mid = (lng_range[0] + lng_range[1]) / 2
+            if lng >= mid:
+                char_idx = char_idx * 2 + 1
+                lng_range[0] = mid
+            else:
+                char_idx = char_idx * 2
+                lng_range[1] = mid
+        else:
+            mid = (lat_range[0] + lat_range[1]) / 2
+            if lat >= mid:
+                char_idx = char_idx * 2 + 1
+                lat_range[0] = mid
+            else:
+                char_idx = char_idx * 2
+                lat_range[1] = mid
+
+        is_lng = not is_lng
+        bits += 1
+        if bits == 5:
+            geohash.append(BASE32[char_idx])
+            bits = 0
+            char_idx = 0
+
+    return "".join(geohash)
+
+
+def search_nearby_events(
+    latitude: float,
+    longitude: float,
+    radius_miles: float = 10.0,
+    classification: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    size: int = 20,
+) -> List[dict]:
+    if not ticketmaster_api_key:
+        raise HTTPException(status_code=501, detail="Ticketmaster API key not configured")
+
+    geohash = _encode_geohash(latitude, longitude)
+    params: dict[str, str] = {
+        "apikey": ticketmaster_api_key,
+        "geoPoint": geohash,
+        "radius": str(int(max(radius_miles, 1))),
+        "unit": "miles",
+        "size": str(size),
+        "sort": "date,asc",
+    }
+
+    if classification:
+        params["classificationName"] = classification
+    if start_date:
+        params["startDateTime"] = start_date
+    if end_date:
+        params["endDateTime"] = end_date
+
+    try:
+        resp = requests.get(
+            "https://app.ticketmaster.com/discovery/v2/events.json",
+            params=params,
+        )
+        data = resp.json()
+
+        if resp.status_code != 200:
+            error_msg = data.get("fault", {}).get("faultstring", "Unknown error")
+            raise HTTPException(status_code=502, detail=f"Ticketmaster API error: {error_msg}")
+
+        events = data.get("_embedded", {}).get("events", [])
+        results = []
+
+        for event in events:
+            images = event.get("images", [])
+            image_url = None
+            for img in sorted(images, key=lambda x: x.get("width", 0), reverse=True):
+                if img.get("url"):
+                    image_url = img["url"]
+                    break
+
+            venues = event.get("_embedded", {}).get("venues", [])
+            venue_name = None
+            venue_address = None
+            if venues:
+                v = venues[0]
+                venue_name = v.get("name")
+                parts = [
+                    v.get("address", {}).get("line1", ""),
+                    v.get("city", {}).get("name", ""),
+                    v.get("state", {}).get("stateCode", ""),
+                ]
+                venue_address = ", ".join(p for p in parts if p)
+
+            dates = event.get("dates", {})
+            start_info = dates.get("start", {})
+            date_str = start_info.get("localDate")
+            time_str = start_info.get("localTime")
+
+            price_ranges = event.get("priceRanges", [])
+            min_price = None
+            max_price = None
+            currency = None
+            if price_ranges:
+                min_price = price_ranges[0].get("min")
+                max_price = price_ranges[0].get("max")
+                currency = price_ranges[0].get("currency", "USD")
+
+            classifications = event.get("classifications", [])
+            segment = None
+            genre = None
+            if classifications:
+                c = classifications[0]
+                segment = c.get("segment", {}).get("name")
+                genre = c.get("genre", {}).get("name")
+
+            results.append({
+                "id": event.get("id"),
+                "name": event.get("name"),
+                "image_url": image_url,
+                "date": date_str,
+                "time": time_str,
+                "venue_name": venue_name,
+                "venue_address": venue_address,
+                "min_price": min_price,
+                "max_price": max_price,
+                "currency": currency,
+                "segment": segment,
+                "genre": genre,
+                "ticket_url": event.get("url"),
+            })
+
+        return results
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error searching events: {str(e)}")
+
+
+@app.post("/night_out_events")
+async def get_night_out_events(req: NightOutEventRequest):
+    excluded = set(req.excluded_event_ids)
+    max_event_price = BUDGET_TO_MAX_EVENT_PRICE.get(req.budget)
+
+    from datetime import timedelta
+    today = datetime.utcnow()
+    default_start = req.start_date or today.strftime("%Y-%m-%dT%H:%M:%SZ")
+    default_end = req.end_date or (today + timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    MAX_RADIUS = 100.0
+    current_radius = req.radius_miles
+
+    while current_radius <= MAX_RADIUS:
+        events = search_nearby_events(
+            latitude=req.latitude,
+            longitude=req.longitude,
+            radius_miles=current_radius,
+            classification=req.classification,
+            start_date=default_start,
+            end_date=default_end,
+        )
+
+        if excluded:
+            events = [e for e in events if e["id"] not in excluded]
+
+        if max_event_price is not None:
+            events = [
+                e for e in events
+                if e.get("min_price") is None or e["min_price"] <= max_event_price
+            ]
+
+        if events:
+            pick = random.choice(events)
+            pick["party_size"] = req.party_size
+            pick["budget"] = req.budget
+            pick["radius_used_miles"] = current_radius
+            return pick
+
+        current_radius *= 2
+        if current_radius > MAX_RADIUS:
+            raise HTTPException(status_code=404, detail="No events found nearby")
+
+    raise HTTPException(status_code=404, detail="No events found nearby")
+
+
+@app.get("/event_classifications")
+def event_classifications():
+    return [
+        {"id": "music", "name": "Music"},
+        {"id": "sports", "name": "Sports"},
+        {"id": "arts", "name": "Arts & Theatre"},
+        {"id": "film", "name": "Film"},
+        {"id": "miscellaneous", "name": "Other"},
+    ]
+
+
+def _get_tmdb_youtube_trailer(asset_id: int, asset_type: str) -> Optional[str]:
+    """Fetch the YouTube trailer key for a movie or TV show from TMDB."""
+    if not tmdb_api_key:
+        return None
+    media = "movie" if asset_type == "movie" else "tv"
+    url = f"https://api.themoviedb.org/3/{media}/{asset_id}/videos?api_key={tmdb_api_key}&language=en-US"
+    try:
+        resp = requests.get(url, timeout=5)
+        if resp.status_code != 200:
+            return None
+        results = resp.json().get("results", [])
+        for v in results:
+            if v.get("site") == "YouTube" and v.get("type") == "Trailer":
+                return v.get("key")
+        for v in results:
+            if v.get("site") == "YouTube" and v.get("type") == "Teaser":
+                return v.get("key")
+        for v in results:
+            if v.get("site") == "YouTube":
+                return v.get("key")
+        return None
+    except Exception:
+        return None
+
+
+def _get_tmdb_watch_url(asset_id: int, asset_type: str) -> str:
+    media = "movie" if asset_type == "movie" else "tv"
+    return f"https://www.themoviedb.org/{media}/{asset_id}/watch"
+
+
+def _get_watchmode_sources(tmdb_id: int, asset_type: str) -> List[dict]:
+    """Fetch streaming sources with deep links from Watchmode using TMDB ID."""
+    if not watchmode_api_key:
+        return []
+
+    search_field = "tmdb_movie_id" if asset_type == "movie" else "tmdb_tv_id"
+    search_url = (
+        f"https://api.watchmode.com/v1/search/"
+        f"?apiKey={watchmode_api_key}"
+        f"&search_field={search_field}&search_value={tmdb_id}"
+    )
+    try:
+        resp = requests.get(search_url, timeout=5)
+        if resp.status_code != 200:
+            return []
+        results = resp.json().get("title_results", [])
+        if not results:
+            return []
+
+        watchmode_id = results[0].get("id")
+        if not watchmode_id:
+            return []
+
+        sources_url = (
+            f"https://api.watchmode.com/v1/title/{watchmode_id}/sources/"
+            f"?apiKey={watchmode_api_key}&regions=US"
+        )
+        resp = requests.get(sources_url, timeout=5)
+        if resp.status_code != 200:
+            return []
+
+        raw_sources = resp.json()
+        if not isinstance(raw_sources, list):
+            return []
+
+        sources = []
+        seen = set()
+        for s in raw_sources:
+            name = s.get("name", "")
+            stype = s.get("type", "")
+            key = f"{name}_{stype}"
+            if key in seen:
+                continue
+            seen.add(key)
+            sources.append({
+                "source_id": s.get("source_id"),
+                "name": name,
+                "type": stype,
+                "web_url": s.get("web_url"),
+                "ios_url": s.get("ios_url"),
+                "android_url": s.get("android_url"),
+                "price": s.get("price"),
+                "format": s.get("format"),
+            })
+        return sources
+    except Exception as e:
+        print(f"Watchmode error: {e}")
+        return []
+
 
 @app.get("/night_in_genres")
 def night_in_genres():
@@ -331,6 +647,20 @@ async def get_night_in_suggestion(req: NightInSuggestionRequest):
     except Exception as e:
         print(f"Could not fetch watch providers: {e}")
         pick["watch_providers"] = []
+
+    try:
+        youtube_key = _get_tmdb_youtube_trailer(pick["id"], asset_type)
+        pick["youtube_trailer_key"] = youtube_key
+    except Exception:
+        pick["youtube_trailer_key"] = None
+
+    pick["tmdb_watch_url"] = _get_tmdb_watch_url(pick["id"], asset_type)
+
+    try:
+        streaming_sources = _get_watchmode_sources(pick["id"], asset_type)
+        pick["streaming_sources"] = streaming_sources
+    except Exception:
+        pick["streaming_sources"] = []
 
     return pick
 
@@ -696,6 +1026,8 @@ def search_nearby_places(
         "places.primaryType",
         "places.editorialSummary",
         "places.priceLevel",
+        "places.websiteUri",
+        "places.googleMapsUri",
     ])
     headers = {
         "Content-Type": "application/json",
@@ -749,6 +1081,8 @@ def search_nearby_places(
                 "type": place.get("primaryType"),
                 "summary": place.get("editorialSummary", {}).get("text"),
                 "price_level": price_int,
+                "website_url": place.get("websiteUri"),
+                "google_maps_url": place.get("googleMapsUri"),
             })
         return results
     except Exception as e:

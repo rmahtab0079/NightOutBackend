@@ -2,7 +2,8 @@
 Restaurant scraper using Google Places API.
 
 Fetches restaurants near a user's location, filtered by cuisine type.
-Respects dietary preferences when tagging and scoring.
+Runs additional dietary-specific searches (e.g. halal_restaurant) when the
+user has matching dietary preferences.
 """
 
 from __future__ import annotations
@@ -30,6 +31,24 @@ CUISINE_TO_PLACE_TYPES: dict[str, list[str]] = {
     "Middle Eastern": ["middle_eastern_restaurant"],
 }
 
+# Google Places types for dietary preferences that have first-class support.
+DIETARY_TO_PLACE_TYPES: dict[str, list[str]] = {
+    "Halal": ["halal_restaurant"],
+    "Vegetarian": ["vegetarian_restaurant"],
+    "Vegan": ["vegan_restaurant"],
+}
+
+# Cuisines that commonly serve halal food — searched as an extra signal
+# when the user has the Halal dietary preference.
+HALAL_ADJACENT_CUISINES: list[str] = [
+    "pakistani_restaurant",
+    "turkish_restaurant",
+    "bangladeshi_restaurant",
+    "moroccan_restaurant",
+    "afghani_restaurant",
+    "lebanese_restaurant",
+]
+
 # Dietary preference keywords used to tag restaurants from their names/summaries
 DIETARY_KEYWORDS: dict[str, list[str]] = {
     "Vegetarian": ["vegetarian", "veggie", "plant-based", "meatless"],
@@ -47,13 +66,15 @@ def scrape_restaurants(
     longitude: float,
     radius_miles: float = 50.0,
     cuisines: Optional[list[str]] = None,
+    dietary: Optional[list[str]] = None,
     max_per_cuisine: int = 10,
 ) -> list[ScrapedEvent]:
     """
     Fetch restaurants from Google Places API, grouped by cuisine type.
 
     If cuisines is provided, searches specifically for those cuisine types
-    in ranked order. Otherwise does a general restaurant search.
+    in ranked order. If dietary preferences are provided, runs additional
+    dedicated searches (e.g. ``halal_restaurant``) and auto-tags results.
     """
     api_key = os.getenv("GOOGLE_PLACES_API_KEY", "")
     if not api_key:
@@ -64,6 +85,7 @@ def scrape_restaurants(
     results: list[ScrapedEvent] = []
     seen_names: set[str] = set()
 
+    # --- Cuisine-based searches (existing behaviour) ---
     if cuisines:
         for cuisine in cuisines:
             place_types = CUISINE_TO_PLACE_TYPES.get(cuisine, ["restaurant"])
@@ -92,7 +114,46 @@ def scrape_restaurants(
                     tags.append(cuisine_tag)
                 results.append(_place_to_event(p, tags, cuisine_tag))
 
-    print(f"[restaurants] Scraped {len(results)} restaurants")
+    # --- Dietary-specific searches ---
+    dietary_count = 0
+    for diet in (dietary or []):
+        diet_types = DIETARY_TO_PLACE_TYPES.get(diet)
+        if not diet_types:
+            continue
+
+        places = _search_places(
+            api_key, latitude, longitude, radius_meters,
+            included_types=diet_types,
+            max_results=20,
+        )
+        diet_tag = diet.lower()
+        for p in places:
+            if p["name"] not in seen_names:
+                seen_names.add(p["name"])
+                tags = ["food", "restaurant", diet_tag]
+                results.append(_place_to_event(p, tags, None))
+                dietary_count += 1
+
+        # For Halal, also search halal-adjacent cuisine types
+        if diet == "Halal":
+            for adj_type in HALAL_ADJACENT_CUISINES:
+                adj_places = _search_places(
+                    api_key, latitude, longitude, radius_meters,
+                    included_types=[adj_type],
+                    max_results=10,
+                )
+                for p in adj_places:
+                    if p["name"] not in seen_names:
+                        seen_names.add(p["name"])
+                        cuisine_label = adj_type.replace("_restaurant", "").replace("_", " ")
+                        tags = ["food", "restaurant", "halal", cuisine_label]
+                        results.append(_place_to_event(p, tags, cuisine_label))
+                        dietary_count += 1
+
+    if dietary_count:
+        print(f"[restaurants] Dietary-specific searches added {dietary_count} restaurants")
+
+    print(f"[restaurants] Scraped {len(results)} restaurants total")
     return results
 
 
@@ -109,13 +170,13 @@ def tag_dietary_matches(
 
     for r in restaurants:
         text = f"{r.name} {r.description or ''} {' '.join(r.tags)}".lower()
-        matched_diets: list[str] = []
+        existing_tags = {t.lower() for t in r.tags}
         for diet in dietary_preferences:
+            if diet.lower() in existing_tags:
+                continue
             keywords = DIETARY_KEYWORDS.get(diet, [diet.lower()])
             if any(kw in text for kw in keywords):
-                matched_diets.append(diet)
-        if matched_diets:
-            r.tags.extend([d.lower() for d in matched_diets])
+                r.tags.append(diet.lower())
 
     return restaurants
 
@@ -231,6 +292,8 @@ def _place_to_event(
         tags=tags,
         category="dining",
         genre=cuisine,
+        rating=place.get("rating"),
+        review_count=place.get("user_rating_count"),
     )
 
 

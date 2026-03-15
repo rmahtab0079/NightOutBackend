@@ -326,9 +326,9 @@ def get_similar_assets(
             read_from_local=read_from_local,
             top_n=fetch_count
         )
-    except Exception as e:
+    except (ValueError, Exception) as e:
         print(f"API fetch error: {e}")
-        raise
+        return []
     
     # Apply genre, year, and exclusion filters
     filtered_results = _filter_results_by_params(

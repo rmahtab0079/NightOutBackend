@@ -90,7 +90,8 @@ def scrape_ticketmaster(
         raw_events = data.get("_embedded", {}).get("events", [])
         results: list[ScrapedEvent] = []
 
-        for ev in raw_events:
+        total_results = len(raw_events)
+        for idx, ev in enumerate(raw_events):
             images = ev.get("images", [])
             image_url = None
             for img in sorted(images, key=lambda x: x.get("width", 0), reverse=True):
@@ -133,7 +134,6 @@ def scrape_ticketmaster(
                 c = classifications[0]
                 segment = c.get("segment", {}).get("name")
                 genre = c.get("genre", {}).get("name")
-                # Don't store "Undefined" from API — treat as missing
                 if segment and str(segment).strip().lower() == "undefined":
                     segment = None
                 if genre and str(genre).strip().lower() == "undefined":
@@ -152,6 +152,13 @@ def scrape_ticketmaster(
             description = (
                 ev.get("info") or ev.get("description") or ev.get("pleaseNote")
             )
+
+            # Popularity: result position in relevance-sorted list is a signal.
+            # Earlier results (lower idx) are more popular per TM's algorithm.
+            position_score = max(0.0, 1.0 - idx / max(total_results, 1))
+            has_presales = bool((ev.get("sales") or {}).get("presales"))
+            if has_presales:
+                position_score = min(1.0, position_score + 0.15)
 
             results.append(ScrapedEvent(
                 source="ticketmaster",
@@ -172,6 +179,7 @@ def scrape_ticketmaster(
                 tags=tags,
                 category=category,
                 genre=genre,
+                popularity_score=round(position_score, 3),
             ))
 
         print(f"[ticketmaster] Scraped {len(results)} events")

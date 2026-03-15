@@ -1,217 +1,251 @@
-"""Eventbrite event scraper using their public search endpoint."""
+"""Eventbrite event scraper via city-browse __SERVER_DATA__."""
 
 from __future__ import annotations
 
+import json
+import re
 import requests
-from datetime import datetime, timedelta
 from typing import Optional
 
-from .models import ScrapedEvent, CLASSIFICATION_TO_CATEGORY
+from .models import ScrapedEvent
 
-# Eventbrite category ID -> our canonical tag
-_EB_CATEGORY_MAP: dict[str, tuple[str, str]] = {
-    "103": ("music", "music"),           # Music
-    "101": ("arts", "business"),         # Business
-    "110": ("food", "food & drink"),     # Food & Drink
-    "105": ("arts", "performing arts"),  # Performing & Visual Arts
-    "108": ("sports", "sports"),         # Sports & Fitness
-    "113": ("arts", "community"),        # Community
-    "104": ("arts", "film & media"),     # Film, Media & Entertainment
-    "109": ("outdoors", "travel"),       # Travel & Outdoor
-    "107": ("arts", "charity"),          # Charity & Causes
-    "102": ("arts", "science"),          # Science & Technology
+_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
+
+_EB_CATEGORY_MAP: dict[str, str] = {
+    "103": "music",
+    "101": "arts",
+    "110": "food",
+    "105": "arts",
+    "108": "sports",
+    "113": "other",
+    "104": "arts",
+    "109": "outdoors",
+    "107": "other",
+    "102": "arts",
+}
+
+_EB_DISPLAY_CATEGORY_MAP: dict[str, str] = {
+    "music": "music",
+    "food & drink": "food",
+    "performing & visual arts": "arts",
+    "sports & fitness": "sports",
+    "film, media & entertainment": "arts",
+    "travel & outdoor": "outdoors",
+    "community & culture": "other",
+    "charity & causes": "other",
+    "business": "other",
+    "science & technology": "arts",
+    "health & wellness": "sports",
 }
 
 
 def scrape_eventbrite(
     latitude: float,
     longitude: float,
-    radius_miles: float = 25.0,
+    radius_miles: float = 50.0,
     days_ahead: int = 14,
     page_size: int = 50,
     keyword: Optional[str] = None,
 ) -> list[ScrapedEvent]:
     """
-    Scrape public events from Eventbrite's search page API.
+    Scrape public events from Eventbrite's city-browse page.
 
-    Eventbrite's search page makes XHR requests to an internal endpoint.
-    We replicate those requests to get public event data.
+    Fetches the browse HTML page and extracts event data from the
+    embedded ``window.__SERVER_DATA__`` JSON blob.  The old XHR API
+    endpoint no longer accepts unauthenticated requests.
     """
-    results: list[ScrapedEvent] = []
-
-    now = datetime.utcnow()
-    start = now.strftime("%Y-%m-%dT%H:%M:%S")
-    end = (now + timedelta(days=days_ahead)).strftime("%Y-%m-%dT%H:%M:%S")
-
-    search_url = "https://www.eventbrite.com/api/v3/destination/search/"
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        ),
-        "Accept": "application/json",
-        "Referer": "https://www.eventbrite.com/d/united-states/events/",
-    }
-
     km_radius = radius_miles * 1.60934
-    params = {
-        "dates": "current_future",
-        "date_range": f"{start}--{end}",
-        "page_size": str(min(page_size, 50)),
-        "latitude": str(latitude),
-        "longitude": str(longitude),
-        "within": f"{km_radius}km",
-        "page": "1",
-    }
-    if keyword and keyword.strip():
-        params["q"] = keyword.strip()
+    browse_url = (
+        f"https://www.eventbrite.com/d/united-states/events/"
+        f"?location_within={km_radius:.0f}km"
+        f"&location_latitude={latitude}"
+        f"&location_longitude={longitude}"
+    )
+
+    results: list[ScrapedEvent] = []
+    seen_ids: set[str] = set()
 
     try:
-        resp = requests.get(search_url, params=params, headers=headers, timeout=15)
-
+        resp = requests.get(browse_url, headers=_HEADERS, timeout=20)
         if resp.status_code != 200:
-            print(f"[eventbrite] Status {resp.status_code}, trying fallback")
-            return _scrape_eventbrite_fallback(latitude, longitude, radius_miles, days_ahead)
+            print(f"[eventbrite] Browse page returned {resp.status_code}")
+            return results
 
-        data = resp.json()
-        events = data.get("events", {}).get("results", [])
-
+        events = _extract_server_data_events(resp.text)
         for ev in events:
-            tags: list[str] = []
-            category: Optional[str] = None
+            if ev.source_id not in seen_ids:
+                seen_ids.add(ev.source_id)
+                results.append(ev)
 
-            cat_id = ev.get("primary_category", {}).get("id")
-            if cat_id and str(cat_id) in _EB_CATEGORY_MAP:
-                cat, tag = _EB_CATEGORY_MAP[str(cat_id)]
-                category = cat
-                tags.append(tag)
-
-            for t in ev.get("tags", []):
-                tag_text = t.get("display_name", "").lower()
-                if tag_text:
-                    tags.append(tag_text)
-
-            venue = ev.get("primary_venue", {})
-            venue_lat = venue.get("address", {}).get("latitude")
-            venue_lon = venue.get("address", {}).get("longitude")
-
-            start_info = ev.get("start_date", "")
-            date_str = time_str = None
-            if start_info:
-                parts = start_info.split("T")
-                date_str = parts[0] if parts else None
-                time_str = parts[1] if len(parts) > 1 else None
-
-            image_url = ev.get("image", {}).get("url")
-
-            ticket_info = ev.get("ticket_availability", {})
-            min_price = ticket_info.get("minimum_ticket_price", {}).get("major_value")
-            max_price = ticket_info.get("maximum_ticket_price", {}).get("major_value")
-            if min_price is not None:
-                try:
-                    min_price = float(min_price)
-                except (ValueError, TypeError):
-                    min_price = None
-            if max_price is not None:
-                try:
-                    max_price = float(max_price)
-                except (ValueError, TypeError):
-                    max_price = None
-
-            results.append(ScrapedEvent(
-                source="eventbrite",
-                source_id=str(ev.get("id", "")),
-                name=ev.get("name", "Unknown"),
-                date=date_str,
-                time=time_str,
-                venue_name=venue.get("name"),
-                venue_address=venue.get("address", {}).get("localized_address_display"),
-                latitude=float(venue_lat) if venue_lat else None,
-                longitude=float(venue_lon) if venue_lon else None,
-                image_url=image_url,
-                description=ev.get("summary"),
-                url=ev.get("url"),
-                min_price=min_price,
-                max_price=max_price,
-                tags=tags,
-                category=category,
-            ))
-
-        print(f"[eventbrite] Scraped {len(results)} events")
+        if not results:
+            results = _extract_json_ld_events(resp.text)
 
     except Exception as e:
         print(f"[eventbrite] Error: {e}")
-        results = _scrape_eventbrite_fallback(latitude, longitude, radius_miles, days_ahead)
+
+    print(f"[eventbrite] Scraped {len(results)} events")
+    return results
+
+
+def _extract_server_data_events(html: str) -> list[ScrapedEvent]:
+    """Parse events from window.__SERVER_DATA__ embedded in the HTML."""
+    m = re.search(
+        r"window\.__SERVER_DATA__\s*=\s*({.*?});\s*</script>",
+        html,
+        re.DOTALL,
+    )
+    if not m:
+        m = re.search(r"window\.__SERVER_DATA__\s*=\s*({.*?});", html, re.DOTALL)
+    if not m:
+        return []
+
+    try:
+        data = json.loads(m.group(1))
+    except json.JSONDecodeError:
+        return []
+
+    results: list[ScrapedEvent] = []
+    buckets = data.get("buckets", [])
+    for bucket in buckets:
+        if not isinstance(bucket, dict):
+            continue
+        for ev in bucket.get("events", []):
+            parsed = _parse_server_data_event(ev)
+            if parsed:
+                results.append(parsed)
 
     return results
 
 
-def _scrape_eventbrite_fallback(
-    latitude: float,
-    longitude: float,
-    radius_miles: float = 25.0,
-    days_ahead: int = 14,
-) -> list[ScrapedEvent]:
-    """Fallback: scrape Eventbrite's public HTML listing and extract JSON-LD data."""
+def _parse_server_data_event(ev: dict) -> Optional[ScrapedEvent]:
+    """Convert a single __SERVER_DATA__ event dict into a ScrapedEvent."""
+    name = ev.get("name")
+    if not name:
+        return None
+
+    if ev.get("is_online_event"):
+        return None
+
+    event_id = str(ev.get("id") or ev.get("eventbrite_event_id") or "")
+
+    date_str = ev.get("start_date")
+    time_str = ev.get("start_time")
+
+    venue = ev.get("primary_venue") or {}
+    addr = venue.get("address") or {}
+    venue_lat = _safe_float(addr.get("latitude"))
+    venue_lng = _safe_float(addr.get("longitude"))
+
+    image_url = (ev.get("image") or {}).get("url")
+
+    tags: list[str] = []
+    category: Optional[str] = None
+    for t in ev.get("tags", []):
+        if not isinstance(t, dict):
+            continue
+        prefix = t.get("prefix", "")
+        display = (t.get("display_name") or "").lower()
+        tag_value = t.get("tag", "")
+
+        if prefix == "EventbriteCategory":
+            cat_id = tag_value.rsplit("/", 1)[-1] if "/" in tag_value else ""
+            if cat_id in _EB_CATEGORY_MAP:
+                category = category or _EB_CATEGORY_MAP[cat_id]
+            if display in _EB_DISPLAY_CATEGORY_MAP:
+                category = category or _EB_DISPLAY_CATEGORY_MAP[display]
+        if display:
+            tags.append(display)
+
+    urgency = ev.get("urgency_signals") or {}
+    urgency_msgs = urgency.get("messages") or []
+    selling_fast = "fewTickets" in urgency_msgs or "salesEndSoon" in urgency_msgs
+
+    return ScrapedEvent(
+        source="eventbrite",
+        source_id=event_id,
+        name=name,
+        date=date_str,
+        time=time_str,
+        venue_name=venue.get("name"),
+        venue_address=addr.get("localized_address_display"),
+        latitude=venue_lat,
+        longitude=venue_lng,
+        image_url=image_url,
+        description=ev.get("summary"),
+        url=ev.get("url"),
+        tags=tags,
+        category=category,
+        is_selling_fast=selling_fast,
+    )
+
+
+def _extract_json_ld_events(html: str) -> list[ScrapedEvent]:
+    """Fallback: extract events from JSON-LD script blocks."""
     results: list[ScrapedEvent] = []
-    try:
-        city_url = f"https://www.eventbrite.com/d/nearby--{latitude},{longitude}/events/"
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            ),
-        }
-        resp = requests.get(city_url, headers=headers, timeout=15)
-        if resp.status_code != 200:
-            print(f"[eventbrite-fallback] Status {resp.status_code}")
-            return results
+    ld_blocks = re.findall(
+        r'<script type="application/ld\+json">(.*?)</script>',
+        html,
+        re.DOTALL,
+    )
+    for block in ld_blocks:
+        try:
+            data = json.loads(block)
+        except json.JSONDecodeError:
+            continue
 
-        import json
-        import re
-        ld_blocks = re.findall(
-            r'<script type="application/ld\+json">(.*?)</script>',
-            resp.text,
-            re.DOTALL,
-        )
-        for block in ld_blocks:
-            try:
-                data = json.loads(block)
-                items = data if isinstance(data, list) else [data]
-                for item in items:
-                    if item.get("@type") != "Event":
-                        continue
-                    location = item.get("location", {})
-                    address = location.get("address", {})
-                    geo = location.get("geo", {})
-                    start_date = item.get("startDate", "")
-                    date_str = time_str = None
-                    if "T" in start_date:
-                        date_str, time_str = start_date.split("T", 1)
-                    else:
-                        date_str = start_date
+        items = data if isinstance(data, list) else [data]
+        if isinstance(data, dict) and data.get("@type") == "ItemList":
+            items = data.get("itemListElement", [])
 
-                    results.append(ScrapedEvent(
-                        source="eventbrite",
-                        source_id=item.get("url", ""),
-                        name=item.get("name", "Unknown"),
-                        date=date_str,
-                        time=time_str,
-                        venue_name=location.get("name"),
-                        venue_address=address.get("streetAddress"),
-                        latitude=float(geo["latitude"]) if "latitude" in geo else None,
-                        longitude=float(geo["longitude"]) if "longitude" in geo else None,
-                        image_url=item.get("image"),
-                        description=item.get("description"),
-                        url=item.get("url"),
-                        tags=[],
-                        category=None,
-                    ))
-            except (json.JSONDecodeError, KeyError):
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if item.get("@type") == "ListItem":
+                item = item.get("item", item)
+            if item.get("@type") != "Event":
                 continue
 
-        print(f"[eventbrite-fallback] Scraped {len(results)} events")
-    except Exception as e:
-        print(f"[eventbrite-fallback] Error: {e}")
+            location = item.get("location") or {}
+            address = location.get("address") or {}
+            geo = location.get("geo") or {}
+
+            start_date = item.get("startDate", "")
+            date_str = time_str = None
+            if "T" in start_date:
+                date_str, time_str = start_date.split("T", 1)
+            else:
+                date_str = start_date or None
+
+            results.append(ScrapedEvent(
+                source="eventbrite",
+                source_id=item.get("url", ""),
+                name=item.get("name", "Unknown"),
+                date=date_str,
+                time=time_str,
+                venue_name=location.get("name"),
+                venue_address=address.get("streetAddress"),
+                latitude=_safe_float(geo.get("latitude")),
+                longitude=_safe_float(geo.get("longitude")),
+                image_url=item.get("image"),
+                description=item.get("description"),
+                url=item.get("url"),
+                tags=[],
+                category=None,
+            ))
 
     return results
+
+
+def _safe_float(val) -> Optional[float]:
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return None

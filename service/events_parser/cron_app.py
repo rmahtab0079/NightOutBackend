@@ -59,6 +59,36 @@ async def run_events_parser(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/send_daily_picks")
+async def send_daily_picks(
+    authorization: Optional[str] = Header(default=None),
+):
+    """
+    Compose and publish daily-picks push notifications for all users.
+
+    Called by Cloud Scheduler at 6 PM ET daily, or manually via Makefile.
+    """
+    cron_secret = os.getenv("EVENTS_PARSER_CRON_SECRET", "")
+    if cron_secret:
+        token = (authorization or "").replace("Bearer ", "")
+        if token != cron_secret:
+            raise HTTPException(status_code=403, detail="Invalid cron secret")
+
+    from .notifications import compose_daily_picks, publish_daily_picks
+
+    try:
+        payloads = compose_daily_picks()
+        published = publish_daily_picks(payloads)
+        return {
+            "status": "completed",
+            "users_composed": len(payloads),
+            "messages_published": published,
+        }
+    except Exception as e:
+        print(f"Daily picks error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 def main():
     """CLI entry point for manual runs."""
     import argparse

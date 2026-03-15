@@ -71,6 +71,13 @@ def _build_genre_index(
     return genre_to_ids
 
 
+def _tfidf_max_df_safe(n_docs: int) -> float:
+    """Use max_df that won't trigger 'max_df corresponds to fewer documents than min_df' for tiny corpora."""
+    if n_docs < 2:
+        return 1.0
+    return 0.95
+
+
 def _compute_top_similar_ids(
     user_plot_texts: List[str],
     candidate_ids: List[int],
@@ -82,8 +89,15 @@ def _compute_top_similar_ids(
         return []
 
     all_texts = user_plot_texts + candidate_texts
-    vectorizer = TfidfVectorizer(stop_words="english", min_df=1, max_df=0.95)
-    tfidf_matrix = vectorizer.fit_transform(all_texts)
+    try:
+        vectorizer = TfidfVectorizer(
+            stop_words="english",
+            min_df=1,
+            max_df=_tfidf_max_df_safe(len(all_texts)),
+        )
+        tfidf_matrix = vectorizer.fit_transform(all_texts)
+    except ValueError:
+        return candidate_ids[:limit]
 
     user_vectors = tfidf_matrix[: len(user_plot_texts)]
     candidate_vectors = tfidf_matrix[len(user_plot_texts) :]
@@ -143,9 +157,16 @@ def _build_genre_tfidf_cache(
         if not filtered_ids:
             continue
         texts = [id_to_plot[cid] for cid in filtered_ids]
-        vectorizer = TfidfVectorizer(stop_words="english", min_df=1, max_df=0.95)
-        candidate_matrix = vectorizer.fit_transform(texts)
-        genre_cache[genre_id] = (vectorizer, filtered_ids, candidate_matrix)
+        try:
+            vectorizer = TfidfVectorizer(
+                stop_words="english",
+                min_df=1,
+                max_df=_tfidf_max_df_safe(len(texts)),
+            )
+            candidate_matrix = vectorizer.fit_transform(texts)
+            genre_cache[genre_id] = (vectorizer, filtered_ids, candidate_matrix)
+        except ValueError:
+            continue
 
     _GENRE_TFIDF_CACHE[cache_key] = genre_cache
     return genre_cache
@@ -168,10 +189,17 @@ def _compute_user_genre_recommendations(
 
     watched_ids = [int(i) for i in watched_ids]
     user_plot_texts = [id_to_plot[i] for i in watched_ids if i in id_to_plot]
-    if not user_plot_texts:
-        return {}
-
     excluded_ids: Set[int] = set(watched_ids) | set(disliked_ids)
+
+    # New users (no watched items): fill each genre with top candidates by order
+    if not user_plot_texts:
+        genre_recs = {}
+        for genre_id, candidate_ids in genre_to_ids.items():
+            filtered = [cid for cid in candidate_ids if cid not in excluded_ids][:limit]
+            if filtered:
+                genre_recs[str(genre_id)] = filtered
+        return genre_recs
+
     genre_recs: Dict[str, List[int]] = {}
     for genre_id, candidate_ids in genre_to_ids.items():
         if genre_tfidf_cache and genre_id in genre_tfidf_cache:

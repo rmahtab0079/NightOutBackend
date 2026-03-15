@@ -130,3 +130,54 @@ events-parser-trigger:
 	curl -X POST "$$SERVICE_URL/run_events_parser" \
 		-H "Authorization: Bearer $$(gcloud auth print-identity-token)" \
 		-H "Content-Type: application/json"
+
+# ---- Daily Picks Push Notifications ----
+DAILY_PICKS_TOPIC := daily-picks
+
+daily-picks-create-topic:
+	@echo "Creating Pub/Sub topic $(DAILY_PICKS_TOPIC)..."
+	@gcloud pubsub topics create $(DAILY_PICKS_TOPIC) --project $(PROJECT) --quiet 2>/dev/null || \
+		echo "Topic $(DAILY_PICKS_TOPIC) already exists."
+
+daily-picks-create-scheduler:
+	@echo "Creating Cloud Scheduler job to send daily picks at 6 PM ET..."
+	@SERVICE_URL=$$(gcloud run services describe $(EVENTS_PARSER_SERVICE) \
+		--project $(PROJECT) --region $(REGION) --format='value(status.url)'); \
+	SA_EMAIL=$$(gcloud projects describe $(PROJECT) --format='value(projectNumber)'); \
+	SA_EMAIL="$$SA_EMAIL-compute@developer.gserviceaccount.com"; \
+	gcloud scheduler jobs create http daily-picks-cron \
+		--project $(PROJECT) \
+		--location $(REGION) \
+		--schedule "0 18 * * *" \
+		--uri "$$SERVICE_URL/send_daily_picks" \
+		--http-method POST \
+		--oidc-service-account-email "$$SA_EMAIL" \
+		--oidc-token-audience "$$SERVICE_URL" \
+		--time-zone "America/New_York" \
+		--attempt-deadline 300s \
+		--quiet
+	@echo "Scheduler created: runs daily at 6 PM ET."
+
+daily-picks-trigger:
+	@SERVICE_URL=$$(gcloud run services describe $(EVENTS_PARSER_SERVICE) \
+		--project $(PROJECT) --region $(REGION) --format='value(status.url)'); \
+	curl -X POST "$$SERVICE_URL/send_daily_picks" \
+		-H "Authorization: Bearer $$(gcloud auth print-identity-token)" \
+		-H "Content-Type: application/json"
+
+daily-picks-deploy-function:
+	@echo "Deploying daily_picks_notify Cloud Function..."
+	gcloud functions deploy daily_picks_notify \
+		--project $(PROJECT) \
+		--region $(REGION) \
+		--runtime python312 \
+		--trigger-topic $(DAILY_PICKS_TOPIC) \
+		--entry-point daily_picks_notify \
+		--source cloud_functions/daily_picks_notify \
+		--memory 256MB \
+		--timeout 60s \
+		--quiet
+	@echo "Cloud Function deployed."
+
+daily-picks-setup: daily-picks-create-topic daily-picks-deploy-function daily-picks-create-scheduler
+	@echo "Daily picks notification system fully set up."

@@ -9,7 +9,7 @@ from typing import Optional
 
 @dataclass
 class ScrapedEvent:
-    source: str  # ticketmaster | eventbrite | amc | partiful
+    source: str  # ticketmaster | eventbrite | amc | partiful | google_places
     source_id: str
     name: str
     date: Optional[str] = None
@@ -28,6 +28,14 @@ class ScrapedEvent:
     category: Optional[str] = None
     genre: Optional[str] = None
     scraped_at: str = field(default_factory=lambda: datetime.utcnow().isoformat() + "Z")
+
+    # --- Popularity signals ---
+    popularity_score: Optional[float] = None
+    rsvp_count: Optional[int] = None
+    interested_count: Optional[int] = None
+    rating: Optional[float] = None
+    review_count: Optional[int] = None
+    is_selling_fast: bool = False
 
     def to_dict(self) -> dict:
         return {k: v for k, v in asdict(self).items() if v is not None}

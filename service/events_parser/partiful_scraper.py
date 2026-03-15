@@ -5,10 +5,9 @@ from __future__ import annotations
 import json
 import re
 import requests
-from datetime import datetime
 from typing import Optional
 
-from .models import ScrapedEvent, CLASSIFICATION_TO_CATEGORY
+from .models import ScrapedEvent
 
 _DISCOVER_URLS = [
     "https://partiful.com/discover",
@@ -41,9 +40,25 @@ _TAG_CATEGORY_MAP: dict[str, str] = {
     "fitness": "sports",
     "outdoor": "outdoors",
     "hiking": "outdoors",
-    "meet new people": "food",
-    "networking": "food",
+    "meet new people": "other",
+    "networking": "other",
 }
+
+_STRUCTURED_TAG_MAP: dict[str, str] = {
+    "MUSIC": "music",
+    "ARTS": "arts",
+    "FILM": "arts",
+    "FOOD": "food",
+    "FOOD_AND_DRINK": "food",
+    "NIGHTLIFE": "music",
+    "SPORTS": "sports",
+    "FITNESS": "sports",
+    "OUTDOOR": "outdoors",
+    "COMMUNITY": "other",
+}
+
+_GENERIC_STRUCTURED_TAGS = {"DISCOVER_HOME", "COMMUNITY"}
+_LOCATION_TAG_PREFIXES = ("NYC_", "LA_", "SF_")
 
 
 def scrape_partiful(
@@ -52,15 +67,16 @@ def scrape_partiful(
     """
     Scrape public events from Partiful's discover pages.
 
-    Partiful primarily covers NYC and LA. We scrape their rendered HTML
-    and extract event data from embedded JSON or structured markup.
+    Partiful serves events for NYC, LA, and SF via __NEXT_DATA__
+    embedded in HTML. The /discover page uses a `trendingSections` dict
+    keyed by city; /discover/partilist uses a `sections` list.
     """
     results: list[ScrapedEvent] = []
     seen_ids: set[str] = set()
 
     for url in _DISCOVER_URLS:
         try:
-            resp = requests.get(url, headers=_HEADERS, timeout=15)
+            resp = requests.get(url, headers=_HEADERS, timeout=30)
             if resp.status_code != 200:
                 print(f"[partiful] {url} returned {resp.status_code}")
                 continue
@@ -77,7 +93,7 @@ def scrape_partiful(
     if city:
         city_url = f"https://partiful.com/discover?city={city.lower().replace(' ', '-')}"
         try:
-            resp = requests.get(city_url, headers=_HEADERS, timeout=15)
+            resp = requests.get(city_url, headers=_HEADERS, timeout=30)
             if resp.status_code == 200:
                 for ev in _extract_from_html(resp.text):
                     if ev.source_id not in seen_ids:
@@ -91,7 +107,7 @@ def scrape_partiful(
 
 
 def _extract_from_html(html: str) -> list[ScrapedEvent]:
-    """Extract event data from Partiful HTML — tries JSON-LD, then __NEXT_DATA__."""
+    """Extract event data from Partiful HTML via __NEXT_DATA__ or JSON-LD."""
     results: list[ScrapedEvent] = []
 
     ld_blocks = re.findall(
@@ -115,21 +131,118 @@ def _extract_from_html(html: str) -> list[ScrapedEvent]:
         html,
         re.DOTALL,
     )
-    if next_data:
-        try:
-            nd = json.loads(next_data.group(1))
-            page_props = nd.get("props", {}).get("pageProps", {})
-            events = page_props.get("events", [])
-            if not events:
-                events = page_props.get("discoverEvents", [])
-            for ev_data in events:
-                ev = _parse_next_data_event(ev_data)
-                if ev:
-                    results.append(ev)
-        except (json.JSONDecodeError, KeyError):
-            pass
+    if not next_data:
+        return results
+
+    try:
+        nd = json.loads(next_data.group(1))
+    except json.JSONDecodeError:
+        return results
+
+    page_props = nd.get("props", {}).get("pageProps", {})
+
+    # --- New format: trendingSections (dict keyed by city) ---
+    trending = page_props.get("trendingSections")
+    if isinstance(trending, dict):
+        for _city, section in trending.items():
+            if isinstance(section, dict):
+                for item in section.get("items", []):
+                    ev = _parse_section_item(item)
+                    if ev:
+                        results.append(ev)
+
+    # --- New format: sections (list on /discover/partilist) ---
+    sections = page_props.get("sections")
+    if isinstance(sections, list):
+        for section in sections:
+            if isinstance(section, dict):
+                for item in section.get("items", []):
+                    ev = _parse_section_item(item)
+                    if ev:
+                        results.append(ev)
+
+    # --- Legacy format: flat event lists (kept for backward compat) ---
+    legacy_events = page_props.get("events") or page_props.get("discoverEvents") or []
+    for ev_data in legacy_events:
+        ev = _parse_legacy_event(ev_data)
+        if ev:
+            results.append(ev)
 
     return results
+
+
+def _parse_section_item(wrapper: dict) -> Optional[ScrapedEvent]:
+    """Parse a section item from Partiful's current __NEXT_DATA__ format.
+
+    Each wrapper has shape: {id, type, descriptionTags, event: {...}, tags: [...]}
+    """
+    ev = wrapper.get("event")
+    if not isinstance(ev, dict):
+        return None
+
+    name = ev.get("title") or ev.get("name")
+    if not name:
+        return None
+
+    event_id = ev.get("id", "")
+
+    date_str, time_str = _split_iso_datetime(ev.get("startDate", ""))
+
+    loc_info = ev.get("locationInfo") or {}
+    maps_info = loc_info.get("mapsInfo") or {}
+    venue_name = maps_info.get("name") or loc_info.get("displayName")
+    address_lines = loc_info.get("displayAddressLines") or maps_info.get("addressLines") or []
+    venue_address = ", ".join(address_lines) if address_lines else None
+
+    lat, lng = _extract_lat_lng_from_maps(maps_info)
+
+    image_url = _extract_image_url(ev.get("image"))
+
+    text_tags = _infer_tags(name, ev.get("description", ""))
+
+    structured_tags = wrapper.get("tags") or []
+    struct_category = None
+    fallback_struct_category = None
+    for st in structured_tags:
+        if not isinstance(st, dict):
+            continue
+        tag_id = st.get("id", "")
+        if tag_id.startswith(_LOCATION_TAG_PREFIXES) or tag_id == "DISCOVER_HOME":
+            continue
+        if tag_id in _STRUCTURED_TAG_MAP:
+            mapped = _STRUCTURED_TAG_MAP[tag_id]
+            if tag_id in _GENERIC_STRUCTURED_TAGS:
+                fallback_struct_category = fallback_struct_category or mapped
+            else:
+                struct_category = struct_category or mapped
+        label = (st.get("label") or "").lower()
+        if label and label != "all":
+            text_tags.append(label)
+
+    category = struct_category or _category_from_tags(text_tags) or fallback_struct_category
+
+    going = ev.get("goingGuestCount") or 0
+    interested = ev.get("interestedGuestCount") or 0
+    maybe = ev.get("maybeGuestCount") or 0
+
+    return ScrapedEvent(
+        source="partiful",
+        source_id=f"partiful_{event_id}",
+        name=name,
+        date=date_str,
+        time=time_str,
+        venue_name=venue_name,
+        venue_address=venue_address,
+        latitude=lat,
+        longitude=lng,
+        image_url=image_url,
+        description=ev.get("description"),
+        url=f"https://partiful.com/e/{event_id}" if event_id else None,
+        tags=text_tags,
+        category=category,
+        rsvp_count=going if going else None,
+        interested_count=(interested + maybe) if (interested or maybe) else None,
+    )
 
 
 def _parse_ld_event(item: dict) -> Optional[ScrapedEvent]:
@@ -140,12 +253,8 @@ def _parse_ld_event(item: dict) -> Optional[ScrapedEvent]:
     location = item.get("location", {})
     geo = location.get("geo", {})
     address = location.get("address", {})
-    start_date = item.get("startDate", "")
-    date_str = time_str = None
-    if "T" in start_date:
-        date_str, time_str = start_date.split("T", 1)
-    elif start_date:
-        date_str = start_date
+
+    date_str, time_str = _split_iso_datetime(item.get("startDate", ""))
 
     event_url = item.get("url", "")
     event_id = event_url.split("/")[-1] if event_url else item.get("name", "")
@@ -171,20 +280,16 @@ def _parse_ld_event(item: dict) -> Optional[ScrapedEvent]:
     )
 
 
-def _parse_next_data_event(ev: dict) -> Optional[ScrapedEvent]:
-    """Parse an event from Partiful's __NEXT_DATA__ payload."""
+def _parse_legacy_event(ev: dict) -> Optional[ScrapedEvent]:
+    """Parse an event from the old flat events/discoverEvents list format."""
     name = ev.get("title") or ev.get("name")
     if not name:
         return None
 
     event_id = ev.get("id") or ev.get("slug") or name
     location = ev.get("location", {}) or {}
-    start = ev.get("startDate") or ev.get("start") or ""
-    date_str = time_str = None
-    if "T" in start:
-        date_str, time_str = start.split("T", 1)
-    elif start:
-        date_str = start
+
+    date_str, time_str = _split_iso_datetime(ev.get("startDate") or ev.get("start") or "")
 
     tags = _infer_tags(name, ev.get("description", ""))
     if ev.get("tags"):
@@ -207,6 +312,56 @@ def _parse_next_data_event(ev: dict) -> Optional[ScrapedEvent]:
         tags=tags,
         category=category,
     )
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _split_iso_datetime(raw: str) -> tuple[Optional[str], Optional[str]]:
+    """Split an ISO datetime string into (date, time) parts."""
+    if not raw:
+        return None, None
+    if "T" in raw:
+        parts = raw.split("T", 1)
+        return parts[0], parts[1]
+    return raw, None
+
+
+def _extract_lat_lng_from_maps(maps_info: dict) -> tuple[Optional[float], Optional[float]]:
+    """Extract latitude/longitude from Apple Maps or Google Maps URLs."""
+    apple_url = maps_info.get("appleMapsUrl", "")
+    m = re.search(r"sll=([-\d.]+),([-\d.]+)", apple_url)
+    if m:
+        try:
+            return float(m.group(1)), float(m.group(2))
+        except ValueError:
+            pass
+
+    google_url = maps_info.get("googleMapsUrl", "")
+    m = re.search(r"query=([-\d.]+),([-\d.]+)", google_url)
+    if m:
+        try:
+            return float(m.group(1)), float(m.group(2))
+        except ValueError:
+            pass
+
+    return None, None
+
+
+def _extract_image_url(image_data) -> Optional[str]:
+    """Pull a usable image URL from Partiful's nested image object."""
+    if image_data is None:
+        return None
+    if isinstance(image_data, str):
+        return image_data
+    if isinstance(image_data, dict):
+        return (
+            image_data.get("url")
+            or (image_data.get("upload") or {}).get("url")
+            or (image_data.get("gif") or {}).get("url")
+        )
+    return None
 
 
 def _infer_tags(name: str, description: str) -> list[str]:

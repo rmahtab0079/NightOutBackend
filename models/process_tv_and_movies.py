@@ -90,6 +90,7 @@ def get_asset_df_from_storage(blob_path: str, asset_type: str) -> pd.DataFrame:
         blob.download_to_filename(temp_path)
         movie_df = pd.read_parquet(temp_path, engine="pyarrow")
         movie_df = movie_df.drop_duplicates(subset=title, keep="first")
+        movie_df = movie_df.drop_duplicates(subset="id", keep="first")
         return movie_df
     finally:
         try:
@@ -214,8 +215,8 @@ def get_asset_df(asset_type : str) -> pd.DataFrame:
         file_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "datasets", "tv_dataset.parquet")
         title = "original_name"
     asset_df = pd.read_parquet(file_path, engine="pyarrow")
-    asset_df = asset_df.drop_duplicates(subset=title, keep='first')
-
+    asset_df = asset_df.drop_duplicates(subset=title, keep="first")
+    asset_df = asset_df.drop_duplicates(subset="id", keep="first")
     return asset_df
 
 def get_movie_plot(movie_name: str) -> str:
@@ -258,9 +259,11 @@ def genre_similarity(movies: set[int], asset_type: str) -> pd.DataFrame:
     This function reads the Parquet File, processes genre_ids, and returns a DataFrame with crosstab operation.
     """
     movie_genre_df = get_asset_df(asset_type)
+    # Ensure unique ids so crosstab index has no duplicates (avoids reindex errors)
+    movie_genre_df = movie_genre_df.drop_duplicates(subset="id", keep="first")
 
     # Explode the 'genre_ids' column to split lists into individual rows
-    movie_genre_df = movie_genre_df.explode('genre_ids')
+    movie_genre_df = movie_genre_df.explode("genre_ids")
 
     # Convert genre_ids to integers if necessary (may currently be strings)
     movie_genre_df['genre_ids'] = movie_genre_df['genre_ids'].astype(float)
@@ -443,8 +446,10 @@ def find_similar_asset_v2(assets: set[int], asset_type: str, read_from_local: bo
             asset_df = get_asset_df_from_storage(tv_path, asset_type)
             title = "original_name"
     
-    asset_df.set_index('id', inplace=True)
-    
+    # Ensure unique index to avoid "cannot reindex on an axis with duplicate labels"
+    asset_df = asset_df.drop_duplicates(subset="id", keep="first")
+    asset_df.set_index("id", inplace=True)
+
     # Normalize asset_type for functions that expect "movies"/"tv"
     asset_type_plural = "movies" if asset_type == "movie" else "tv"
     
@@ -466,8 +471,9 @@ def find_similar_asset_v2(assets: set[int], asset_type: str, read_from_local: bo
         # Fallback to overview-based similarity if plots not available
         return _find_similar_asset_fallback(assets, asset_df, asset_type, title, genre_sim_df, top_n)
     
-    # Create a lookup dict for fast access: id -> plot
-    plots_lookup = dict(zip(plots_df['id'], plots_df['plot']))
+    # Create a lookup dict for fast access: id -> plot (dedupe by id so index is unique later)
+    plots_df = plots_df.drop_duplicates(subset="id", keep="first")
+    plots_lookup = dict(zip(plots_df["id"], plots_df["plot"]))
     print(f"Loaded {len(plots_lookup)} pre-computed plots")
     
     # Step 3: Get plots for input movies and candidates
@@ -507,12 +513,12 @@ def find_similar_asset_v2(assets: set[int], asset_type: str, read_from_local: bo
     )
     
     # Step 5: Compute cosine similarity
-    # Create user profile by averaging input movie TF-IDF vectors
-    input_movie_ids = list(input_plots.keys())
+    # Create user profile by averaging input movie TF-IDF vectors (dedupe to avoid reindex errors)
+    input_movie_ids = list(dict.fromkeys(input_plots.keys()))
     user_profile = tfidf_df.loc[input_movie_ids].mean(axis=0).values.reshape(1, -1)
-    
-    # Get candidate vectors
-    candidate_ids = list(candidate_plots.keys())
+
+    # Get candidate vectors (dedupe to avoid reindex errors)
+    candidate_ids = list(dict.fromkeys(candidate_plots.keys()))
     candidate_vectors = tfidf_df.loc[candidate_ids].values
     
     # Compute cosine similarity between user profile and all candidates

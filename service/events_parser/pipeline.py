@@ -80,6 +80,7 @@ def _scrape_restaurants_for_user(
         latitude, longitude,
         radius_miles=radius_miles,
         cuisines=cuisines if cuisines else None,
+        dietary=dietary if dietary else None,
         max_per_cuisine=14,
     )
     restaurants = tag_dietary_matches(restaurants, dietary)
@@ -184,16 +185,7 @@ def run_pipeline(
                 size=KEYWORD_SEARCH_SIZE,
                 keyword=kw,
             )
-            eb_events = scrape_eventbrite(
-                cluster["latitude"],
-                cluster["longitude"],
-                radius_miles=radius_miles,
-                days_ahead=days_ahead,
-                page_size=min(KEYWORD_SEARCH_SIZE, 50),
-                keyword=kw,
-            )
             keyword_events.extend(tm_events)
-            keyword_events.extend(eb_events)
         keyword_events = _dedup(keyword_events)
         total_events += len(keyword_events)
         if keywords_list:

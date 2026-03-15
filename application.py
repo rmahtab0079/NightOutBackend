@@ -1,6 +1,9 @@
 from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 import random
+import threading
+import time
 from pydantic import BaseModel
 from typing import Optional, List, Set
 from dotenv import load_dotenv
@@ -8,6 +11,11 @@ import requests
 import json
 import os
 from datetime import datetime
+
+# Events parser: allow triggering from main app (on signup / before home load)
+_events_parser_lock = threading.Lock()
+_events_parser_last_run_time: Optional[float] = None
+EVENTS_PARSER_COOLDOWN_SECONDS = 3600  # 1 hour cooldown between runs
 
 # Firebase Admin SDK imports
 import firebase_admin
@@ -73,7 +81,8 @@ if os.getenv("ENABLE_GENRE_RECS_JOB", "true").lower() == "true":
 api_key = "AIzaSyDW0X1gO6uVSPkYIa3R6sjRwNQrz-afYU0"
 ticketmaster_api_key = os.getenv("TICKETMASTER_API_KEY", "")
 tmdb_api_key = os.getenv("TMDB_API_KEY", "")
-watchmode_api_key = os.getenv("WATCHMODE_API_KEY", "")
+# Watchmode API for streaming deeplinks (Netflix, Amazon Prime, etc.). Override with WATCHMODE_API_KEY in .env.
+watchmode_api_key = os.getenv("WATCHMODE_API_KEY", "z4h3DYeMSEGbpvPgJUw3l8h6iJUuQOVGjov4hiqq")
 
 places_of_interest = ["hiking_area", "restaurant", "bar", "cafe", "coffee_shop", "beach",
                       "historical_landmark", "movie_theater", "video_arcade", "karaoke", "night_club", "opera_house",
@@ -260,11 +269,11 @@ def _verify_admin_token(admin_token: Optional[str]) -> None:
 def _get_precomputed_genre_ids(
     email: str,
     asset_type: str,
-    genre_ids: List[int],
+    genre_ids: Optional[List[int]] = None,
 ) -> List[int]:
     """
     Fetch precomputed genre recommendations for a user.
-    Returns a deduped list of asset IDs for the requested genres.
+    Returns a deduped list of asset IDs. If genre_ids is None or empty, returns all IDs from all genres.
     """
     initialize_firebase_if_needed()
     if firebase_db is None:
@@ -280,8 +289,9 @@ def _get_precomputed_genre_ids(
 
     ordered_ids: List[int] = []
     seen: Set[int] = set()
-    for gid in genre_ids:
-        ids = genre_map.get(str(gid), [])
+    keys_to_use = [str(gid) for gid in genre_ids] if genre_ids else list(genre_map.keys())
+    for gid_key in keys_to_use:
+        ids = genre_map.get(gid_key, [])
         for asset_id in ids:
             try:
                 aid = int(asset_id)
@@ -348,6 +358,7 @@ class NightOutEventRequest(BaseModel):
     interests: List[str] = []
     start_date: Optional[str] = None
     end_date: Optional[str] = None
+    days_ahead: Optional[int] = None  # horizon in days (e.g. 90 for onboarding diversity)
     excluded_event_ids: List[str] = []
 
 
@@ -566,8 +577,9 @@ async def get_night_out_events(req: NightOutEventRequest):
 async def get_nearby_events_batch(req: NightOutEventRequest):
     from datetime import timedelta
     today = datetime.utcnow()
+    horizon_days = req.days_ahead if req.days_ahead is not None else 90
     default_start = req.start_date or today.strftime("%Y-%m-%dT%H:%M:%SZ")
-    default_end = req.end_date or (today + timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    default_end = req.end_date or (today + timedelta(days=horizon_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     events = search_nearby_events(
         latitude=req.latitude,
@@ -577,7 +589,7 @@ async def get_nearby_events_batch(req: NightOutEventRequest):
         keyword=req.keyword,
         start_date=default_start,
         end_date=default_end,
-        size=20,
+        size=60,
     )
 
     excluded = set(req.excluded_event_ids)
@@ -590,7 +602,7 @@ async def get_nearby_events_batch(req: NightOutEventRequest):
 class NearbyPlacesBatchRequest(BaseModel):
     latitude: float
     longitude: float
-    radius_meters: float = 16093.4  # ~10 miles
+    radius_meters: float = 80467.0  # ~50 miles for onboarding diversity
 
 
 @app.post("/nearby_places_batch")
@@ -663,6 +675,17 @@ def _get_tmdb_watch_url(asset_id: int, asset_type: str) -> str:
     return f"https://www.themoviedb.org/{media}/{asset_id}/watch"
 
 
+def _clean_deeplink(url) -> Optional[str]:
+    """Return url only if it's a real URL, not a Watchmode paywall message."""
+    if url is None:
+        return None
+    if not isinstance(url, str):
+        url = str(url)
+    if "paid plans" in url.lower() or not (url.startswith("http://") or url.startswith("https://")):
+        return None
+    return url
+
+
 def _get_watchmode_sources(tmdb_id: int, asset_type: str) -> List[dict]:
     """Fetch streaming sources with deep links from Watchmode using TMDB ID."""
     if not watchmode_api_key:
@@ -695,6 +718,8 @@ def _get_watchmode_sources(tmdb_id: int, asset_type: str) -> List[dict]:
             return []
 
         raw_sources = resp.json()
+        if isinstance(raw_sources, dict):
+            raw_sources = raw_sources.get("sources", raw_sources.get("results", []))
         if not isinstance(raw_sources, list):
             return []
 
@@ -707,13 +732,28 @@ def _get_watchmode_sources(tmdb_id: int, asset_type: str) -> List[dict]:
             if key in seen:
                 continue
             seen.add(key)
+            web_url = s.get("web_url") or s.get("url") or s.get("link")
+            if web_url is not None and not isinstance(web_url, str):
+                web_url = str(web_url)
+            if web_url and not (web_url.startswith("http://") or web_url.startswith("https://")):
+                web_url = None
+
+            ios_url = _clean_deeplink(s.get("ios_url"))
+            android_url = _clean_deeplink(s.get("android_url"))
+            deeplink = _clean_deeplink(s.get("deeplink"))
+            ios_url = ios_url or deeplink or web_url
+            android_url = android_url or deeplink or web_url
+
+            if not web_url and not ios_url and not android_url:
+                continue
+
             sources.append({
                 "source_id": s.get("source_id"),
                 "name": name,
                 "type": stype,
-                "web_url": s.get("web_url"),
-                "ios_url": s.get("ios_url"),
-                "android_url": s.get("android_url"),
+                "web_url": web_url,
+                "ios_url": ios_url,
+                "android_url": android_url,
                 "price": s.get("price"),
                 "format": s.get("format"),
             })
@@ -1350,6 +1390,88 @@ async def submit_user_preferences(preferences: UserPreferences, authorization: O
     except Exception as e:
         print(e)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def _run_events_parser_sync(
+    radius_miles: float = 50.0,
+    days_ahead: int = 14,
+    max_events_per_user: int = 80,
+) -> None:
+    """Run the events parser pipeline (blocking). Used from a background thread."""
+    try:
+        from service.events_parser.pipeline import run_pipeline
+        run_pipeline(
+            radius_miles=radius_miles,
+            days_ahead=days_ahead,
+            max_events_per_user=max_events_per_user,
+        )
+    except Exception as e:
+        print(f"Events parser pipeline error: {e}")
+
+
+def _run_genre_precompute_sync(email: str, limit_per_genre: int = 100) -> None:
+    """Run genre recommendations precompute for one user (blocking). Used from a background thread."""
+    try:
+        from service.user_genre_recommendations import precompute_user_genre_recommendations_for_email
+        precompute_user_genre_recommendations_for_email(email, limit_per_genre=limit_per_genre)
+    except Exception as e:
+        print(f"Genre precompute error for {email}: {e}")
+
+
+@app.post("/trigger_events_parser")
+async def trigger_events_parser(
+    authorization: Optional[str] = Header(default=None),
+    radius_miles: float = 50.0,
+    days_ahead: int = 14,
+    force_refresh: bool = False,
+):
+    """
+    Start the events parser pipeline and genre recommendations precompute in the background (in parallel).
+    For new signups and before home load. Requires auth. Returns 202 immediately.
+    Both run at the same time:
+    - Events parser: scrapes events/restaurants and refreshes user_curated_events for all users (1 hour cooldown unless force_refresh=True).
+    - Genre precompute: refreshes movie and TV recommendations for the current user only (no cooldown).
+    """
+    decoded = _verify_and_get_user(authorization)
+    email = decoded.get("email")
+    if not email:
+        raise HTTPException(status_code=400, detail="Email not found in token")
+    initialize_firebase_if_needed()
+    if firebase_db is None:
+        raise HTTPException(status_code=501, detail="Firebase not configured")
+
+    def run_events_parser_background() -> None:
+        global _events_parser_last_run_time
+        with _events_parser_lock:
+            now = time.time()
+            if not force_refresh and (
+                _events_parser_last_run_time is not None
+                and (now - _events_parser_last_run_time) < EVENTS_PARSER_COOLDOWN_SECONDS
+            ):
+                print("Events parser: skipping (cooldown; runs at most once per hour)")
+                return
+            _events_parser_last_run_time = now
+        _run_events_parser_sync(radius_miles=radius_miles, days_ahead=days_ahead)
+        with _events_parser_lock:
+            _events_parser_last_run_time = time.time()
+
+    def run_genre_precompute_background() -> None:
+        _run_genre_precompute_sync(email, limit_per_genre=100)
+
+    # Run events parser in background (curated events for all users)
+    thread_parser = threading.Thread(target=run_events_parser_background, daemon=True)
+    thread_parser.start()
+    # Run genre precompute for this user (movie/TV suggestions for new users)
+    thread_genre = threading.Thread(target=run_genre_precompute_background, daemon=True)
+    thread_genre.start()
+
+    return JSONResponse(
+        status_code=202,
+        content={
+            "message": "Events parser and genre precompute started in background",
+            "status": "accepted",
+        },
+    )
 
 
 @app.get("/user_curated_events")
@@ -2189,10 +2311,7 @@ async def get_recommended_movie_v2(
     Disliked movies (from dislikedMovieIds field) are automatically excluded.
     """
     user_preferences = await get_user_preferences(authorization)
-    movie_ids = user_preferences.get("movieIds", [])
-    
-    if not movie_ids:
-        raise HTTPException(status_code=400, detail="No movie preferences found for user")
+    movie_ids = user_preferences.get("movieIds", []) or []
     
     # Get disliked movie IDs to exclude from recommendations
     disliked_movie_ids = user_preferences.get("dislikedMovieIds", [])
@@ -2214,11 +2333,11 @@ async def get_recommended_movie_v2(
         end_year = _current_year + 1
     
     try:
-        # Prefer precomputed genre recommendations (only when genres filter is provided)
+        # Prefer precomputed genre recommendations (for new users or when genres filter provided)
         email = user_preferences.get("email")
         precomputed_ids = (
             _get_precomputed_genre_ids(email, "movie", genre_list)
-            if (email and genre_list)
+            if email
             else []
         )
 
@@ -2256,7 +2375,9 @@ async def get_recommended_movie_v2(
                     break
             return {"results": results, "count": len(results), "offset": offset, "has_more": (skipped + len(results)) < len(precomputed_ids)}
 
-        # Fallback to dynamic recommendation
+        # Fallback to dynamic recommendation (requires at least one movie preference)
+        if not movie_ids:
+            return {"results": [], "count": 0, "offset": offset, "has_more": False}
         results = get_similar_assets(
             asset_ids=set(movie_ids),
             asset_type="movie",
@@ -2300,10 +2421,7 @@ async def get_recommended_tv_v2(
     Disliked TV shows (from dislikedTvShowIds field) are automatically excluded.
     """
     user_preferences = await get_user_preferences(authorization)
-    tv_ids = user_preferences.get("tvShowIds", [])
-    
-    if not tv_ids:
-        raise HTTPException(status_code=400, detail="No TV show preferences found for user")
+    tv_ids = user_preferences.get("tvShowIds", []) or []
     
     # Get disliked TV show IDs to exclude from recommendations
     disliked_tv_ids = user_preferences.get("dislikedTvShowIds", [])
@@ -2318,7 +2436,7 @@ async def get_recommended_tv_v2(
             raise HTTPException(status_code=400, detail="Invalid genres format. Use comma-separated integers.")
     
     try:
-        # Prefer precomputed genre recommendations
+        # Prefer precomputed genre recommendations (for new users or when genres filter provided)
         email = user_preferences.get("email")
         precomputed_ids = _get_precomputed_genre_ids(email, "tv", genre_list) if email else []
 
@@ -2348,7 +2466,9 @@ async def get_recommended_tv_v2(
                     break
             return {"results": results, "count": len(results)}
 
-        # Fallback to dynamic recommendation
+        # Fallback to dynamic recommendation (requires at least one TV preference)
+        if not tv_ids:
+            return {"results": [], "count": 0}
         results = get_similar_assets(
             asset_ids=set(tv_ids),
             asset_type="tv",
@@ -2378,29 +2498,32 @@ def cache_statistics():
 async def get_watch_providers(asset_type: str, asset_id: int):
     """
     Get watch providers for a movie or TV show.
-    
-    Returns streaming platforms where the content is available.
-    Data is fetched from precomputed parquet files.
-    
-    Path params:
-    - asset_type: 'movie' or 'tv'
-    - asset_id: TMDB movie or TV show ID
+    Returns TMDB provider names plus Watchmode streaming_sources with deeplinks
+    (web_url, ios_url, android_url) for Netflix, Amazon Prime, etc.
     """
     if asset_type not in ("movie", "tv"):
         raise HTTPException(status_code=400, detail="asset_type must be 'movie' or 'tv'")
-    
+
+    providers = []
+    streaming_sources = []
     try:
         from service.watch_providers_job import get_providers_for_asset
         providers = get_providers_for_asset(asset_id, asset_type, read_from_local=False)
-        return {
-            "asset_id": asset_id,
-            "asset_type": asset_type,
-            "providers": providers,
-            "count": len(providers),
-        }
     except Exception as e:
-        print(f"Error fetching watch providers: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"Watch providers (TMDB) error: {e}")
+
+    try:
+        streaming_sources = _get_watchmode_sources(asset_id, asset_type)
+    except Exception as e:
+        print(f"Watchmode streaming sources error: {e}")
+
+    return {
+        "asset_id": asset_id,
+        "asset_type": asset_type,
+        "providers": providers,
+        "streaming_sources": streaming_sources,
+        "count": len(providers) + len(streaming_sources),
+    }
 
 
 @app.post("/cache/clear/memory")

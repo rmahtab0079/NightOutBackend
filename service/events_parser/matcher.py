@@ -6,11 +6,13 @@ Scoring incorporates:
   - Popularity signals (RSVP counts, ratings, selling-fast flags)
   - Temporal signals (event proximity in time, day-of-week fit, freshness)
   - Swipe history
+  - Novelty injection (random picks from outside the user's profile)
 """
 
 from __future__ import annotations
 
 import math
+import random
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -347,11 +349,16 @@ def match_events_to_user(
     user_favorite_artists: Optional[list[str]] = None,
     min_score: float = 0.3,
     max_events: int = 50,
+    novelty_ratio: float = 0.2,
 ) -> list[tuple[ScrapedEvent, float]]:
     """
-    Score and rank all events for a user, returning top matches.
+    Score and rank all events for a user, returning top matches plus
+    a novelty injection of random picks from the broader pool.
 
-    Returns a list of (event, score) tuples sorted by descending score.
+    ``novelty_ratio`` (0.0–1.0) controls what fraction of ``max_events``
+    is reserved for random picks outside the user's top-scored results.
+    These novelty items are tagged so ``group_events_by_category`` can
+    mark them with ``is_novelty: True``.
     """
     scored: list[tuple[ScrapedEvent, float]] = []
     now = datetime.utcnow()
@@ -374,7 +381,27 @@ def match_events_to_user(
             scored.append((event, s))
 
     scored.sort(key=lambda x: x[1], reverse=True)
-    return scored[:max_events]
+
+    novelty_ratio = max(0.0, min(1.0, novelty_ratio))
+    novelty_slots = int(max_events * novelty_ratio)
+    relevance_slots = max_events - novelty_slots
+
+    relevance_picks = scored[:relevance_slots]
+    relevance_ids = {f"{e.source}:{e.source_id}" for e, _ in relevance_picks}
+
+    remaining = [(e, s) for e, s in scored[relevance_slots:] if f"{e.source}:{e.source_id}" not in relevance_ids]
+
+    if remaining and novelty_slots > 0:
+        sample_size = min(novelty_slots, len(remaining))
+        novelty_picks = random.sample(remaining, sample_size)
+        for ev, _ in novelty_picks:
+            ev._is_novelty = True  # type: ignore[attr-defined]
+    else:
+        novelty_picks = []
+
+    combined = relevance_picks + novelty_picks
+    combined.sort(key=lambda x: x[1], reverse=True)
+    return combined[:max_events]
 
 
 # Only these sources are real dining/places; others must not go in "food".
@@ -390,14 +417,18 @@ def group_events_by_category(
     The "food" key is reserved for real dining/places only (Google Places).
     Events from Ticketmaster/Eventbrite/Partiful that were tagged "food" are
     grouped under "other" so the Food tab never shows theatre/entertainment.
+
+    Items tagged ``_is_novelty`` by the matcher are marked with
+    ``is_novelty: True`` in the output dict.
     """
     groups: dict[str, list[dict]] = {}
     for event, score in matched:
         cat = event.category or "other"
-        # Prevent entertainment events from appearing under "food"
         if cat == "food" and event.source not in _DINING_SOURCES:
             cat = "other"
         entry = event.to_dict()
         entry["relevance_score"] = round(score, 2)
+        if getattr(event, "_is_novelty", False):
+            entry["is_novelty"] = True
         groups.setdefault(cat, []).append(entry)
     return groups

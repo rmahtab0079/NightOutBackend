@@ -1671,6 +1671,95 @@ async def curated_categories(authorization: Optional[str] = Header(default=None)
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/reshuffle_curated")
+async def reshuffle_curated(
+    authorization: Optional[str] = Header(default=None),
+    novelty_ratio: float = 0.3,
+):
+    """
+    Reshuffle the user's curated events by swapping out novelty items with
+    fresh random picks from the parsed_events_catalog.  This is a cheap
+    operation that doesn't re-run the full scraping pipeline.
+    """
+    import random as _rand
+    from datetime import datetime as _dt
+
+    initialize_firebase_if_needed()
+    if firebase_db is None:
+        raise HTTPException(status_code=501, detail="Firebase not configured")
+
+    decoded = _verify_and_get_user(authorization)
+    email = decoded.get("email")
+    if not email:
+        raise HTTPException(status_code=400, detail="Email not found in token")
+
+    try:
+        doc = firebase_db.collection("user_curated_events").document(email).get()
+        if not doc.exists:
+            raise HTTPException(status_code=404, detail="No curated events to reshuffle")
+
+        data = doc.to_dict()
+        events_by_cat = data.get("events_by_category", {})
+
+        catalog_docs = firebase_db.collection("parsed_events_catalog").stream()
+        catalog_by_cat: dict[str, list[dict]] = {}
+        for cdoc in catalog_docs:
+            ev = cdoc.to_dict()
+            cat = ev.get("category") or "other"
+            if cat == "food" and ev.get("source") != "google_places":
+                cat = "other"
+            catalog_by_cat.setdefault(cat, []).append(ev)
+
+        swapped = 0
+        for cat, items in events_by_cat.items():
+            existing_ids = {
+                (e.get("source", "") + ":" + (e.get("source_id") or e.get("name", "")))
+                for e in items
+            }
+
+            for e in items:
+                e.pop("is_novelty", None)
+
+            non_novelty = [e for e in items if not e.get("is_novelty")]
+            novelty_count = max(1, int(len(items) * novelty_ratio))
+
+            pool = [
+                e for e in catalog_by_cat.get(cat, [])
+                if (e.get("source", "") + ":" + (e.get("source_id") or e.get("name", ""))) not in existing_ids
+            ]
+
+            if pool:
+                sample_size = min(novelty_count, len(pool))
+                new_novelty = _rand.sample(pool, sample_size)
+                for e in new_novelty:
+                    e["is_novelty"] = True
+                    e["relevance_score"] = round(_rand.uniform(0.3, 1.5), 2)
+                swapped += sample_size
+            else:
+                new_novelty = []
+
+            _rand.shuffle(non_novelty)
+            events_by_cat[cat] = non_novelty + new_novelty
+
+        total = sum(len(v) for v in events_by_cat.values())
+        firebase_db.collection("user_curated_events").document(email).update({
+            "events_by_category": events_by_cat,
+            "total_events": total,
+            "last_updated": _dt.utcnow().isoformat() + "Z",
+            "last_reshuffled": _dt.utcnow().isoformat() + "Z",
+        })
+
+        return {
+            "status": "reshuffled",
+            "items_swapped": swapped,
+            "total_events": total,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 class UpdateLocationRequest(BaseModel):
     latitude: float
     longitude: float
@@ -1993,6 +2082,91 @@ async def get_friends_list(authorization: Optional[str] = Header(default=None)):
     return {"friends": result}
 
 
+# ---------- Friend activity feed ----------
+
+PUBSUB_FRIEND_ACTIVITY_TOPIC = os.getenv("PUBSUB_FRIEND_ACTIVITY_TOPIC", "friend-activity")
+
+
+def _publish_friend_activity(actor_uid: str, actor_name: str, activity_type: str, event_name: str, event_id: str, friend_uids: list[str]) -> None:
+    """Publish a friend-activity message for each friend who should be notified."""
+    publisher = _get_pubsub_publisher()
+    if not publisher or not friend_uids:
+        return
+    try:
+        import json as _json
+        project_id = os.getenv("FIREBASE_PROJECT_ID", os.getenv("GOOGLE_CLOUD_PROJECT"))
+        if not project_id:
+            return
+        topic_path = publisher.topic_path(project_id, PUBSUB_FRIEND_ACTIVITY_TOPIC)
+        payload = _json.dumps({
+            "actor_uid": actor_uid,
+            "actor_name": actor_name,
+            "activity_type": activity_type,
+            "event_name": event_name,
+            "event_id": event_id,
+            "notify_uids": friend_uids,
+        }).encode("utf-8")
+        publisher.publish(topic_path, payload)
+    except Exception as e:
+        print(f"Friend activity publish failed: {e}")
+
+
+@app.get("/friends/feed")
+async def friends_feed(authorization: Optional[str] = Header(default=None)):
+    """
+    Return a chronological activity feed of friends' planned events.
+    Shows events created by friends and events friends are invited to.
+    """
+    initialize_firebase_if_needed()
+    if firebase_db is None:
+        raise HTTPException(status_code=501, detail="Firebase not configured")
+
+    decoded = _verify_and_get_user(authorization)
+    uid = decoded.get("uid")
+    if not uid:
+        raise HTTPException(status_code=400, detail="UID not found in token")
+
+    friend_doc = firebase_db.collection(FRIENDS_COLLECTION).document(uid).get()
+    if not friend_doc.exists:
+        return {"feed": [], "friends_count": 0}
+    friends_map = friend_doc.to_dict().get("friends") or {}
+    friend_uids = list(friends_map.keys())
+    if not friend_uids:
+        return {"feed": [], "friends_count": 0}
+
+    feed: list[dict] = []
+    seen_ids: set[str] = set()
+
+    for batch_start in range(0, len(friend_uids), 10):
+        batch = friend_uids[batch_start:batch_start + 10]
+        created = firebase_db.collection("planned_events").where(
+            "created_by_uid", "in", batch
+        ).stream()
+        for doc in created:
+            if doc.id in seen_ids:
+                continue
+            seen_ids.add(doc.id)
+            d = doc.to_dict()
+            d["event_id"] = doc.id
+            d["feed_type"] = "created"
+            feed.append(d)
+
+        invited = firebase_db.collection("planned_events").where(
+            "invited_uids", "array_contains_any", batch
+        ).stream()
+        for doc in invited:
+            if doc.id in seen_ids:
+                continue
+            seen_ids.add(doc.id)
+            d = doc.to_dict()
+            d["event_id"] = doc.id
+            d["feed_type"] = "invited"
+            feed.append(d)
+
+    feed.sort(key=lambda e: e.get("created_at", ""), reverse=True)
+    return {"feed": feed[:50], "friends_count": len(friend_uids)}
+
+
 # ---------- Planned events (create from event/place/restaurant, invite friends) ----------
 PLANNED_EVENTS_COLLECTION = "planned_events"
 
@@ -2044,6 +2218,27 @@ async def create_planned_event(
         "invited_uids": invited_uids,
         "created_at": now,
     })
+
+    all_friends_to_notify = list(invited_uids)
+    if firebase_db:
+        try:
+            friend_doc = firebase_db.collection(FRIENDS_COLLECTION).document(created_by_uid).get()
+            if friend_doc.exists:
+                all_friends = list((friend_doc.to_dict().get("friends") or {}).keys())
+                all_friends_to_notify = list(set(all_friends_to_notify + all_friends))
+        except Exception:
+            pass
+
+    if all_friends_to_notify:
+        _publish_friend_activity(
+            actor_uid=created_by_uid,
+            actor_name=created_by_name,
+            activity_type="created_event",
+            event_name=req.name,
+            event_id=ref.id,
+            friend_uids=[u for u in all_friends_to_notify if u != created_by_uid],
+        )
+
     return {"event_id": ref.id, "message": "Event created"}
 
 

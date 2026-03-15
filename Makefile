@@ -17,7 +17,7 @@ docker-build:
 	docker buildx build --platform linux/amd64 -t $(IMAGE) --push .
 
 deploy:
-	gcloud run deploy nightout-backend --image $(IMAGE) --region us-east1 --allow-unauthenticated --quiet
+	gcloud run deploy nightout-backend --image $(IMAGE) --project $(PROJECT) --region $(REGION) --allow-unauthenticated --quiet
 
 # ---- Secret Manager .env workflow ----
 gcp-enable-apis:
@@ -181,3 +181,28 @@ daily-picks-deploy-function:
 
 daily-picks-setup: daily-picks-create-topic daily-picks-deploy-function daily-picks-create-scheduler
 	@echo "Daily picks notification system fully set up."
+
+# ---- Friend Activity Notifications ----
+FRIEND_ACTIVITY_TOPIC := friend-activity
+
+friend-activity-create-topic:
+	@echo "Creating Pub/Sub topic $(FRIEND_ACTIVITY_TOPIC)..."
+	@gcloud pubsub topics create $(FRIEND_ACTIVITY_TOPIC) --project $(PROJECT) --quiet 2>/dev/null || \
+		echo "Topic $(FRIEND_ACTIVITY_TOPIC) already exists."
+
+friend-activity-deploy-function:
+	@echo "Deploying friend_activity_notify Cloud Function..."
+	gcloud functions deploy friend_activity_notify \
+		--project $(PROJECT) \
+		--region $(REGION) \
+		--runtime python312 \
+		--trigger-topic $(FRIEND_ACTIVITY_TOPIC) \
+		--entry-point friend_activity_notify \
+		--source cloud_functions/friend_activity_notify \
+		--memory 256MB \
+		--timeout 60s \
+		--quiet
+	@echo "Cloud Function deployed."
+
+friend-activity-setup: friend-activity-create-topic friend-activity-deploy-function
+	@echo "Friend activity notification system fully set up."

@@ -19,6 +19,7 @@ _app_initialized = False
 ACTIVITY_MESSAGES = {
     "created_event": "{name} is going to {event}",
     "accepted_suggestion": "{name} accepted a suggestion: {event}",
+    "join_request": "{name} wants to join your event: {event}",
 }
 
 

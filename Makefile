@@ -206,3 +206,40 @@ friend-activity-deploy-function:
 
 friend-activity-setup: friend-activity-create-topic friend-activity-deploy-function
 	@echo "Friend activity notification system fully set up."
+
+# ---- Broadcast Notification ----
+check-tokens:
+	@echo "Checking registered FCM tokens..."
+	@ADMIN_TOKEN=$$(grep ADMIN_RECS_TOKEN .env 2>/dev/null | cut -d= -f2); \
+	SERVICE_URL=$$(gcloud run services describe $(SERVICE) \
+		--project $(PROJECT) --region $(REGION) --format='value(status.url)'); \
+	curl -s "$$SERVICE_URL/admin/fcm_token_count" \
+		-H "X-Admin-Token: $$ADMIN_TOKEN" ; \
+	echo ""
+
+broadcast:
+	@echo "Sending broadcast push notification to all registered users..."
+	@ADMIN_TOKEN=$$(grep ADMIN_RECS_TOKEN .env 2>/dev/null | cut -d= -f2); \
+	if [ -z "$$ADMIN_TOKEN" ]; then echo "ERROR: Set ADMIN_RECS_TOKEN in .env first"; exit 1; fi; \
+	SERVICE_URL=$$(gcloud run services describe $(SERVICE) \
+		--project $(PROJECT) --region $(REGION) --format='value(status.url)'); \
+	curl -s -X POST "$$SERVICE_URL/admin/broadcast_notification" \
+		-H "X-Admin-Token: $$ADMIN_TOKEN" \
+		-H "Content-Type: application/json" \
+		-d '{"title": "Welcome to Boredom Destroyer! 🎉", "body": "Your personalized picks are ready. Open the app to explore events, food, movies & more near you!"}' ; \
+	echo ""
+
+broadcast-custom:
+	@if [ -z "$(TITLE)" ] || [ -z "$(BODY)" ]; then \
+		echo "Usage: make broadcast-custom TITLE=\"Your title\" BODY=\"Your message\""; \
+		exit 1; \
+	fi
+	@ADMIN_TOKEN=$$(grep ADMIN_RECS_TOKEN .env 2>/dev/null | cut -d= -f2); \
+	if [ -z "$$ADMIN_TOKEN" ]; then echo "ERROR: Set ADMIN_RECS_TOKEN in .env first"; exit 1; fi; \
+	SERVICE_URL=$$(gcloud run services describe $(SERVICE) \
+		--project $(PROJECT) --region $(REGION) --format='value(status.url)'); \
+	curl -s -X POST "$$SERVICE_URL/admin/broadcast_notification" \
+		-H "X-Admin-Token: $$ADMIN_TOKEN" \
+		-H "Content-Type: application/json" \
+		-d "{\"title\": \"$(TITLE)\", \"body\": \"$(BODY)\"}" ; \
+	echo ""

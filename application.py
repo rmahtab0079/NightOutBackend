@@ -22,6 +22,7 @@ import firebase_admin
 from firebase_admin import credentials
 from firebase_admin import firestore
 from firebase_admin import auth as firebase_auth
+from firebase_admin import messaging
 
 app = FastAPI()
 
@@ -1760,6 +1761,105 @@ async def reshuffle_curated(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/featured_picks")
+async def featured_picks(
+    authorization: Optional[str] = Header(default=None),
+    count: int = 12,
+    exclude_ids: Optional[str] = None,
+):
+    """
+    Return a random sample of events + movies + TV for the Featured carousel.
+    Read-only -- no Firestore writes.
+    """
+    import random as _rand
+
+    initialize_firebase_if_needed()
+    if firebase_db is None:
+        raise HTTPException(status_code=501, detail="Firebase not configured")
+
+    decoded = _verify_and_get_user(authorization)
+    email = decoded.get("email")
+
+    exclude_set: set[str] = set()
+    if exclude_ids:
+        exclude_set = {eid.strip() for eid in exclude_ids.split(",") if eid.strip()}
+
+    event_slots = max(1, count - 2)
+    movie_slots = 1
+    tv_slots = 1
+
+    # --- Events from parsed_events_catalog ---
+    catalog_by_cat: dict[str, list[dict]] = {}
+    for cdoc in firebase_db.collection("parsed_events_catalog").stream():
+        ev = cdoc.to_dict()
+        eid = ev.get("source", "") + ":" + (ev.get("source_id") or ev.get("name", ""))
+        if eid in exclude_set:
+            continue
+        cat = ev.get("category") or "other"
+        if cat == "food" and ev.get("source") != "google_places":
+            cat = "other"
+        catalog_by_cat.setdefault(cat, []).append(ev)
+
+    featured: list[dict] = []
+    cats = list(catalog_by_cat.keys())
+    _rand.shuffle(cats)
+    per_cat = max(1, event_slots // max(len(cats), 1))
+    for cat in cats:
+        pool = catalog_by_cat[cat]
+        sample_size = min(per_cat, len(pool))
+        picks = _rand.sample(pool, sample_size)
+        for p in picks:
+            p["_type"] = "event"
+        featured.extend(picks)
+
+    _rand.shuffle(featured)
+    featured = featured[:event_slots]
+
+    # --- Movies ---
+    if email:
+        movie_ids = _get_precomputed_genre_ids(email, "movie")
+        if movie_ids:
+            sample_ids = _rand.sample(movie_ids, min(movie_slots * 3, len(movie_ids)))
+            for mid in sample_ids:
+                mid_str = str(mid)
+                if mid_str in exclude_set:
+                    continue
+                detail = get_movie_detail(mid, "movie")
+                if detail:
+                    featured.append({
+                        "_type": "movie",
+                        "id": mid,
+                        "movie_id": mid,
+                        "title": detail.get("title") or detail.get("original_title"),
+                        **{k: v for k, v in detail.items() if v is not None},
+                    })
+                    if sum(1 for f in featured if f.get("_type") == "movie") >= movie_slots:
+                        break
+
+    # --- TV ---
+    if email:
+        tv_ids = _get_precomputed_genre_ids(email, "tv")
+        if tv_ids:
+            sample_ids = _rand.sample(tv_ids, min(tv_slots * 3, len(tv_ids)))
+            for tid in sample_ids:
+                tid_str = str(tid)
+                if tid_str in exclude_set:
+                    continue
+                detail = get_movie_detail(tid, "tv")
+                if detail:
+                    featured.append({
+                        "_type": "tv",
+                        "id": tid,
+                        "tv_id": tid,
+                        "name": detail.get("name") or detail.get("original_name"),
+                        **{k: v for k, v in detail.items() if v is not None},
+                    })
+                    if sum(1 for f in featured if f.get("_type") == "tv") >= tv_slots:
+                        break
+
+    return {"featured": featured, "count": len(featured)}
+
+
 class UpdateLocationRequest(BaseModel):
     latitude: float
     longitude: float
@@ -2280,6 +2380,117 @@ async def get_planned_events(authorization: Optional[str] = Header(default=None)
     return {"events": events}
 
 
+class JoinEventRequest(BaseModel):
+    event_id: str
+
+
+@app.post("/planned_events/request_join")
+async def request_join_event(
+    req: JoinEventRequest,
+    authorization: Optional[str] = Header(default=None),
+):
+    """Request to join a friend's planned event."""
+    initialize_firebase_if_needed()
+    if firebase_db is None:
+        raise HTTPException(status_code=501, detail="Firebase not configured")
+
+    decoded = _verify_and_get_user(authorization)
+    uid = decoded.get("uid")
+    display_name = (decoded.get("name") or decoded.get("email") or "Someone").strip()
+    if not uid:
+        raise HTTPException(status_code=400, detail="UID not found in token")
+
+    doc = firebase_db.collection(PLANNED_EVENTS_COLLECTION).document(req.event_id).get()
+    if not doc.exists:
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    data = doc.to_dict()
+    creator_uid = data.get("created_by_uid")
+    if uid == creator_uid:
+        raise HTTPException(status_code=400, detail="You are the creator of this event")
+
+    existing_requests = data.get("join_requests") or []
+    if any(r.get("uid") == uid for r in existing_requests):
+        return {"message": "Already requested"}
+
+    invited = data.get("invited_uids") or []
+    if uid in invited:
+        return {"message": "Already invited"}
+
+    now = datetime.utcnow().isoformat() + "Z"
+    firebase_db.collection(PLANNED_EVENTS_COLLECTION).document(req.event_id).update({
+        "join_requests": firestore.ArrayUnion([{
+            "uid": uid,
+            "display_name": display_name,
+            "requested_at": now,
+            "status": "pending",
+        }]),
+    })
+
+    if creator_uid:
+        _publish_friend_activity(
+            actor_uid=uid,
+            actor_name=display_name,
+            activity_type="join_request",
+            event_name=data.get("name", "an event"),
+            event_id=req.event_id,
+            friend_uids=[creator_uid],
+        )
+
+    return {"message": "Join request sent"}
+
+
+class RespondJoinRequest(BaseModel):
+    event_id: str
+    requester_uid: str
+    accept: bool
+
+
+@app.post("/planned_events/respond_join")
+async def respond_join_request(
+    req: RespondJoinRequest,
+    authorization: Optional[str] = Header(default=None),
+):
+    """Accept or decline a join request (only the event creator can do this)."""
+    initialize_firebase_if_needed()
+    if firebase_db is None:
+        raise HTTPException(status_code=501, detail="Firebase not configured")
+
+    decoded = _verify_and_get_user(authorization)
+    uid = decoded.get("uid")
+    if not uid:
+        raise HTTPException(status_code=400, detail="UID not found in token")
+
+    doc_ref = firebase_db.collection(PLANNED_EVENTS_COLLECTION).document(req.event_id)
+    doc = doc_ref.get()
+    if not doc.exists:
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    data = doc.to_dict()
+    if data.get("created_by_uid") != uid:
+        raise HTTPException(status_code=403, detail="Only the event creator can respond")
+
+    join_requests = data.get("join_requests") or []
+    updated = []
+    found = False
+    for r in join_requests:
+        if r.get("uid") == req.requester_uid:
+            found = True
+            r["status"] = "accepted" if req.accept else "declined"
+            r["responded_at"] = datetime.utcnow().isoformat() + "Z"
+        updated.append(r)
+
+    if not found:
+        raise HTTPException(status_code=404, detail="Join request not found")
+
+    update_payload: dict = {"join_requests": updated}
+    if req.accept:
+        update_payload["invited_uids"] = firestore.ArrayUnion([req.requester_uid])
+
+    doc_ref.update(update_payload)
+    return {"message": "accepted" if req.accept else "declined"}
+
+
 class FCMTokenRequest(BaseModel):
     token: str
 
@@ -2308,6 +2519,88 @@ async def register_fcm_token(
         "updated_at": datetime.utcnow().isoformat() + "Z",
     }, merge=True)
     return {"message": "Token registered"}
+
+
+@app.get("/admin/fcm_token_count")
+async def fcm_token_count(
+    x_admin_token: Optional[str] = Header(default=None),
+):
+    """Return the number of users with registered FCM tokens."""
+    _verify_admin_token(x_admin_token)
+    initialize_firebase_if_needed()
+    if firebase_db is None:
+        raise HTTPException(status_code=501, detail="Firebase not configured")
+
+    total_users = 0
+    total_tokens = 0
+    for doc in firebase_db.collection(FCM_TOKENS_COLLECTION).stream():
+        tokens = (doc.to_dict() or {}).get("tokens") or []
+        if tokens:
+            total_users += 1
+            total_tokens += len(tokens)
+    return {"users": total_users, "tokens": total_tokens}
+
+
+class BroadcastNotificationRequest(BaseModel):
+    title: str
+    body: str
+
+
+@app.post("/admin/broadcast_notification")
+async def broadcast_notification(
+    req: BroadcastNotificationRequest,
+    x_admin_token: Optional[str] = Header(default=None),
+):
+    """Send a push notification to every user with a registered FCM token."""
+    _verify_admin_token(x_admin_token)
+    initialize_firebase_if_needed()
+    if firebase_db is None:
+        raise HTTPException(status_code=501, detail="Firebase not configured")
+
+    token_docs = firebase_db.collection(FCM_TOKENS_COLLECTION).stream()
+    sent = 0
+    failed = 0
+    stale_cleaned = 0
+    for doc in token_docs:
+        uid = doc.id
+        tokens = (doc.to_dict() or {}).get("tokens") or []
+        stale: list[str] = []
+        for token in tokens:
+            try:
+                messaging.send(messaging.Message(
+                    notification=messaging.Notification(
+                        title=req.title,
+                        body=req.body,
+                    ),
+                    data={"type": "broadcast"},
+                    token=token,
+                    android=messaging.AndroidConfig(
+                        notification=messaging.AndroidNotification(
+                            channel_id="daily_picks",
+                        ),
+                    ),
+                    apns=messaging.APNSConfig(
+                        payload=messaging.APNSPayload(
+                            aps=messaging.Aps(sound="default"),
+                        ),
+                    ),
+                ))
+                sent += 1
+            except messaging.UnregisteredError:
+                stale.append(token)
+            except Exception:
+                failed += 1
+        if stale:
+            stale_cleaned += len(stale)
+            firebase_db.collection(FCM_TOKENS_COLLECTION).document(uid).update({
+                "tokens": firestore.ArrayRemove(stale),
+            })
+
+    return {
+        "sent": sent,
+        "failed": failed,
+        "stale_tokens_cleaned": stale_cleaned,
+    }
 
 
 @app.get("/get_movie_suggestion")

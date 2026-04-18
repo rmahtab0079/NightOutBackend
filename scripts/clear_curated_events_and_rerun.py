@@ -1,18 +1,27 @@
 #!/usr/bin/env python3
 """
-Clear user_curated_events in Firebase and optionally run the EventsParser pipeline.
+Clear stale event data in Firebase and optionally run the EventsParser pipeline.
 
-Use this after fixing pipeline bugs (e.g. wrong events in the food category)
-so that the next run repopulates with correct data.
+By default this will:
+  1. Purge past and imageless entries from `parsed_events_catalog`.
+  2. Clear every document in `user_curated_events` so the next pipeline run
+     rebuilds user-facing lists from a clean catalog.
+
+Use this after fixing pipeline bugs (e.g. wrong events in the food category,
+or past events lingering from pre-filter runs) so that the next run
+repopulates with correct data.
 
 Usage:
-  # Clear only (you run the cron separately)
+  # Clean up only (cron will refresh lists on its next tick)
   python scripts/clear_curated_events_and_rerun.py
 
-  # Clear and run the pipeline locally
+  # Skip the catalog purge, just wipe per-user curated lists
+  python scripts/clear_curated_events_and_rerun.py --skip-catalog-purge
+
+  # Clean up and run the pipeline locally
   python scripts/clear_curated_events_and_rerun.py --rerun
 
-  # Clear and run with custom radius/days
+  # Clean up and run with custom radius/days
   python scripts/clear_curated_events_and_rerun.py --rerun --radius 50 --days 14
 """
 from __future__ import annotations
@@ -53,10 +62,30 @@ def main() -> None:
         default=14,
         help="Days ahead to search (default 14).",
     )
+    parser.add_argument(
+        "--skip-catalog-purge",
+        action="store_true",
+        help="Do not purge past/imageless entries from parsed_events_catalog.",
+    )
     args = parser.parse_args()
 
-    print("Clearing user_curated_events...")
-    from service.events_parser.firebase_writer import clear_user_curated_events
+    from service.events_parser.firebase_writer import (
+        clear_user_curated_events,
+        purge_stale_parsed_events,
+    )
+
+    if not args.skip_catalog_purge:
+        print("Purging parsed_events_catalog (past + imageless events)...")
+        stats = purge_stale_parsed_events()
+        print(
+            f"Catalog purge: kept={stats['kept']}, "
+            f"past_removed={stats['deleted_past']}, "
+            f"imageless_removed={stats['deleted_no_image']}."
+        )
+    else:
+        print("Skipping parsed_events_catalog purge (--skip-catalog-purge).")
+
+    print("\nClearing user_curated_events...")
     deleted = clear_user_curated_events()
     print(f"Cleared {deleted} user curated event document(s).")
 

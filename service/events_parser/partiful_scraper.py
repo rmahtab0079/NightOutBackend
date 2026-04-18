@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import requests
+from datetime import datetime, timezone
 from typing import Optional
 
 from .models import ScrapedEvent
@@ -184,9 +185,14 @@ def _parse_section_item(wrapper: dict) -> Optional[ScrapedEvent]:
     if not name:
         return None
 
+    start_raw = ev.get("startDate", "")
+    end_raw = ev.get("endDate", "")
+    if not _is_future_or_present(start_raw, end_raw):
+        return None
+
     event_id = ev.get("id", "")
 
-    date_str, time_str = _split_iso_datetime(ev.get("startDate", ""))
+    date_str, time_str = _split_iso_datetime(start_raw)
 
     loc_info = ev.get("locationInfo") or {}
     maps_info = loc_info.get("mapsInfo") or {}
@@ -250,11 +256,16 @@ def _parse_ld_event(item: dict) -> Optional[ScrapedEvent]:
     if item.get("@type") != "Event":
         return None
 
+    start_raw = item.get("startDate", "")
+    end_raw = item.get("endDate", "")
+    if not _is_future_or_present(start_raw, end_raw):
+        return None
+
     location = item.get("location", {})
     geo = location.get("geo", {})
     address = location.get("address", {})
 
-    date_str, time_str = _split_iso_datetime(item.get("startDate", ""))
+    date_str, time_str = _split_iso_datetime(start_raw)
 
     event_url = item.get("url", "")
     event_id = event_url.split("/")[-1] if event_url else item.get("name", "")
@@ -286,10 +297,15 @@ def _parse_legacy_event(ev: dict) -> Optional[ScrapedEvent]:
     if not name:
         return None
 
+    start_raw = ev.get("startDate") or ev.get("start") or ""
+    end_raw = ev.get("endDate") or ev.get("end") or ""
+    if not _is_future_or_present(start_raw, end_raw):
+        return None
+
     event_id = ev.get("id") or ev.get("slug") or name
     location = ev.get("location", {}) or {}
 
-    date_str, time_str = _split_iso_datetime(ev.get("startDate") or ev.get("start") or "")
+    date_str, time_str = _split_iso_datetime(start_raw)
 
     tags = _infer_tags(name, ev.get("description", ""))
     if ev.get("tags"):
@@ -317,6 +333,44 @@ def _parse_legacy_event(ev: dict) -> Optional[ScrapedEvent]:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _parse_iso_datetime(raw: str) -> Optional[datetime]:
+    """Parse an ISO-8601 datetime string into an aware UTC datetime."""
+    if not raw or not isinstance(raw, str):
+        return None
+    s = raw.strip()
+    # Normalize trailing 'Z' to '+00:00' so fromisoformat can parse it.
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        # Date-only values like "2024-10-01"
+        try:
+            dt = datetime.strptime(s[:10], "%Y-%m-%d")
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _is_future_or_present(start_raw: str, end_raw: str = "") -> bool:
+    """Return True if the event has not ended yet.
+
+    Uses endDate when available so events currently in progress are kept;
+    otherwise falls back to startDate. Events missing both dates are kept
+    (to avoid silently dropping items we can't classify).
+    """
+    now = datetime.now(timezone.utc)
+    end_dt = _parse_iso_datetime(end_raw) if end_raw else None
+    if end_dt is not None:
+        return end_dt >= now
+    start_dt = _parse_iso_datetime(start_raw) if start_raw else None
+    if start_dt is not None:
+        return start_dt >= now
+    return True
+
 
 def _split_iso_datetime(raw: str) -> tuple[Optional[str], Optional[str]]:
     """Split an ISO datetime string into (date, time) parts."""

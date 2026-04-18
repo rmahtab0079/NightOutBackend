@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
+import logging
 import random
 import threading
 import time
@@ -10,7 +11,13 @@ from dotenv import load_dotenv
 import requests
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+logger = logging.getLogger("nightout")
 
 # Events parser: allow triggering from main app (on signup / before home load)
 _events_parser_lock = threading.Lock()
@@ -1491,7 +1498,11 @@ async def get_user_curated_events(authorization: Optional[str] = Header(default=
         doc = firebase_db.collection("user_curated_events").document(email).get()
         if not doc.exists:
             return {"events_by_category": {}, "total_events": 0}
-        return doc.to_dict()
+        data = doc.to_dict()
+        filtered = _filter_events_by_category(data.get("events_by_category", {}))
+        data["events_by_category"] = filtered
+        data["total_events"] = sum(len(v) for v in filtered.values() if isinstance(v, list))
+        return data
     except HTTPException:
         raise
     except Exception as e:
@@ -1499,6 +1510,78 @@ async def get_user_curated_events(authorization: Optional[str] = Header(default=
 
 
 PARSED_EVENTS_CATALOG_COLLECTION = "parsed_events_catalog"
+
+
+def _event_is_future_or_present(event: dict) -> bool:
+    """
+    Return True if the event is today or in the future.
+
+    Filters out stale events returned from Firestore that predate the
+    parser-side date filter. Items without a `date` field (e.g. restaurants
+    from Google Places) are always kept — they aren't time-bound.
+    """
+    date_str = (event.get("date") or "").strip()
+    if not date_str:
+        return True
+
+    time_str = (event.get("time") or "").strip()
+    now_utc = datetime.now(timezone.utc)
+
+    if time_str:
+        iso = f"{date_str}T{time_str}"
+        if iso.endswith("Z"):
+            iso = iso[:-1] + "+00:00"
+        try:
+            dt = datetime.fromisoformat(iso)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc) >= now_utc
+        except ValueError:
+            pass
+
+    try:
+        event_date = datetime.strptime(date_str[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return True
+    return event_date >= now_utc.date()
+
+
+def _event_has_image(event: dict) -> bool:
+    """
+    Return True if the item has a usable image URL.
+
+    Applied uniformly to events AND restaurants — anything without a real
+    image_url is dropped so the UI never has to render a placeholder card.
+    A "usable" URL must start with http(s) so we don't accept sentinels like
+    "None", "null", or relative paths that would 404 in Image.network.
+    """
+    image_url = (event.get("image_url") or "").strip()
+    if not image_url:
+        return False
+    lower = image_url.lower()
+    if lower in {"none", "null", "false"}:
+        return False
+    return lower.startswith("http://") or lower.startswith("https://")
+
+
+def _event_passes_filters(event: dict) -> bool:
+    """True if the event is not in the past AND has a usable image."""
+    return _event_is_future_or_present(event) and _event_has_image(event)
+
+
+def _filter_events_by_category(
+    events_by_category: dict,
+) -> dict:
+    """Return a copy of `events_by_category` with past/imageless events dropped."""
+    if not isinstance(events_by_category, dict):
+        return events_by_category
+    filtered: dict = {}
+    for cat, items in events_by_category.items():
+        if isinstance(items, list):
+            filtered[cat] = [e for e in items if _event_passes_filters(e)]
+        else:
+            filtered[cat] = items
+    return filtered
 
 
 @app.get("/event_catalog/{catalog_id:path}")
@@ -1602,7 +1685,7 @@ async def curated_event_pick(
             raise HTTPException(status_code=404, detail="No curated events available")
 
         data = doc.to_dict()
-        events_by_cat = data.get("events_by_category", {})
+        events_by_cat = _filter_events_by_category(data.get("events_by_category", {}))
 
         excluded_ids = set(req.excluded_ids)
         excluded_names = {n.strip().lower() for n in req.excluded_names if n.strip()}
@@ -1659,7 +1742,7 @@ async def curated_categories(authorization: Optional[str] = Header(default=None)
             return {"categories": {}, "total_events": 0}
 
         data = doc.to_dict()
-        events_by_cat = data.get("events_by_category", {})
+        events_by_cat = _filter_events_by_category(data.get("events_by_category", {}))
         categories = {cat: len(events) for cat, events in events_by_cat.items()}
         return {
             "categories": categories,
@@ -1706,6 +1789,8 @@ async def reshuffle_curated(
         catalog_by_cat: dict[str, list[dict]] = {}
         for cdoc in catalog_docs:
             ev = cdoc.to_dict()
+            if not _event_passes_filters(ev):
+                continue
             cat = ev.get("category") or "other"
             if cat == "food" and ev.get("source") != "google_places":
                 cat = "other"
@@ -1792,6 +1877,8 @@ async def featured_picks(
     catalog_by_cat: dict[str, list[dict]] = {}
     for cdoc in firebase_db.collection("parsed_events_catalog").stream():
         ev = cdoc.to_dict()
+        if not _event_passes_filters(ev):
+            continue
         eid = ev.get("source", "") + ":" + (ev.get("source_id") or ev.get("name", ""))
         if eid in exclude_set:
             continue
@@ -2541,6 +2628,51 @@ async def fcm_token_count(
     return {"users": total_users, "tokens": total_tokens}
 
 
+@app.post("/admin/purge_all_fcm_tokens")
+async def purge_all_fcm_tokens(
+    x_admin_token: Optional[str] = Header(default=None),
+    confirm: Optional[str] = Header(default=None, alias="X-Confirm"),
+):
+    """Delete every document in the FCM tokens collection.
+
+    Forces every device to re-register a fresh token on next app launch.
+    Useful when stale/orphaned tokens are suspected (e.g. after a bundle ID
+    or Firebase config change).
+
+    Requires both X-Admin-Token AND X-Confirm: PURGE headers as a safety net.
+    """
+    _verify_admin_token(x_admin_token)
+    if confirm != "PURGE":
+        raise HTTPException(
+            status_code=400,
+            detail="Refusing to purge without 'X-Confirm: PURGE' header.",
+        )
+    initialize_firebase_if_needed()
+    if firebase_db is None:
+        raise HTTPException(status_code=501, detail="Firebase not configured")
+
+    deleted_uids: list[str] = []
+    batch = firebase_db.batch()
+    batch_size = 0
+    for doc in firebase_db.collection(FCM_TOKENS_COLLECTION).stream():
+        deleted_uids.append(doc.id)
+        batch.delete(doc.reference)
+        batch_size += 1
+        # Firestore batches are limited to 500 ops; commit and start a new one.
+        if batch_size >= 400:
+            batch.commit()
+            batch = firebase_db.batch()
+            batch_size = 0
+    if batch_size > 0:
+        batch.commit()
+
+    logger.warning("Purged FCM tokens for %d users: %s", len(deleted_uids), deleted_uids)
+    return {
+        "deleted_users": len(deleted_uids),
+        "uids": deleted_uids,
+    }
+
+
 class BroadcastNotificationRequest(BaseModel):
     title: str
     body: str
@@ -2561,13 +2693,26 @@ async def broadcast_notification(
     sent = 0
     failed = 0
     stale_cleaned = 0
+    recipients: list[dict] = []
+
     for doc in token_docs:
         uid = doc.id
         tokens = (doc.to_dict() or {}).get("tokens") or []
+
+        try:
+            user_record = firebase_auth.get_user(uid)
+            email = user_record.email or "(no email)"
+            display_name = user_record.display_name or ""
+        except Exception:
+            email = "(unknown)"
+            display_name = ""
+
         stale: list[str] = []
+        per_user_results: list[dict] = []
         for token in tokens:
+            token_preview = f"{token[:8]}…{token[-8:]}" if len(token) > 20 else token
             try:
-                messaging.send(messaging.Message(
+                message_id = messaging.send(messaging.Message(
                     notification=messaging.Notification(
                         title=req.title,
                         body=req.body,
@@ -2580,26 +2725,227 @@ async def broadcast_notification(
                         ),
                     ),
                     apns=messaging.APNSConfig(
+                        headers={
+                            "apns-priority": "10",
+                            "apns-push-type": "alert",
+                        },
                         payload=messaging.APNSPayload(
-                            aps=messaging.Aps(sound="default"),
+                            aps=messaging.Aps(
+                                alert=messaging.ApsAlert(
+                                    title=req.title,
+                                    body=req.body,
+                                ),
+                                sound="default",
+                                badge=1,
+                            ),
                         ),
                     ),
                 ))
                 sent += 1
-            except messaging.UnregisteredError:
+                per_user_results.append({
+                    "token": token_preview,
+                    "status": "sent",
+                    "message_id": message_id,
+                })
+                logger.info(
+                    "Broadcast sent: uid=%s email=%s token=%s message_id=%s",
+                    uid, email, token_preview, message_id,
+                )
+            except messaging.UnregisteredError as e:
                 stale.append(token)
-            except Exception:
+                per_user_results.append({
+                    "token": token_preview,
+                    "status": "stale",
+                    "error": str(e),
+                })
+                logger.warning(
+                    "Broadcast stale token: uid=%s email=%s token=%s",
+                    uid, email, token_preview,
+                )
+            except (messaging.ThirdPartyAuthError, messaging.SenderIdMismatchError) as e:
+                # Token was generated by a build pinned to a different APNs
+                # topic / Firebase sender. It can never deliver — treat as stale
+                # and prune so we don't keep retrying on every broadcast.
+                stale.append(token)
+                per_user_results.append({
+                    "token": token_preview,
+                    "status": "stale",
+                    "error": f"{type(e).__name__}: {e}",
+                })
+                logger.warning(
+                    "Broadcast pruning unrecoverable token: uid=%s email=%s token=%s reason=%s",
+                    uid, email, token_preview, type(e).__name__,
+                )
+            except Exception as e:
                 failed += 1
+                per_user_results.append({
+                    "token": token_preview,
+                    "status": "failed",
+                    "error": f"{type(e).__name__}: {e}",
+                })
+                logger.error(
+                    "Broadcast failed: uid=%s email=%s token=%s error=%s",
+                    uid, email, token_preview, e,
+                )
+
         if stale:
             stale_cleaned += len(stale)
             firebase_db.collection(FCM_TOKENS_COLLECTION).document(uid).update({
                 "tokens": firestore.ArrayRemove(stale),
             })
 
+        recipients.append({
+            "uid": uid,
+            "email": email,
+            "display_name": display_name,
+            "tokens": per_user_results,
+        })
+
     return {
         "sent": sent,
         "failed": failed,
         "stale_tokens_cleaned": stale_cleaned,
+        "recipients": recipients,
+    }
+
+
+class TargetedNotificationRequest(BaseModel):
+    uid: str
+    title: str
+    body: str
+
+
+@app.post("/admin/broadcast_to_uid")
+async def broadcast_to_uid(
+    req: TargetedNotificationRequest,
+    x_admin_token: Optional[str] = Header(default=None),
+):
+    """Send a push notification to a single user's tokens (debug helper).
+
+    Useful when triaging delivery problems on a specific device. The response
+    includes per-token status with full FCM message IDs so you can correlate
+    with APNs delivery receipts.
+    """
+    _verify_admin_token(x_admin_token)
+    initialize_firebase_if_needed()
+    if firebase_db is None:
+        raise HTTPException(status_code=501, detail="Firebase not configured")
+
+    doc = firebase_db.collection(FCM_TOKENS_COLLECTION).document(req.uid).get()
+    if not doc.exists:
+        raise HTTPException(status_code=404, detail=f"No FCM tokens found for uid {req.uid}")
+
+    tokens = (doc.to_dict() or {}).get("tokens") or []
+    if not tokens:
+        raise HTTPException(status_code=404, detail=f"User {req.uid} has no registered tokens")
+
+    try:
+        user_record = firebase_auth.get_user(req.uid)
+        email = user_record.email or "(no email)"
+        display_name = user_record.display_name or ""
+    except Exception:
+        email = "(unknown)"
+        display_name = ""
+
+    sent = 0
+    failed = 0
+    stale: list[str] = []
+    per_token: list[dict] = []
+
+    for token in tokens:
+        token_preview = f"{token[:8]}…{token[-8:]}" if len(token) > 20 else token
+        try:
+            message_id = messaging.send(messaging.Message(
+                notification=messaging.Notification(
+                    title=req.title,
+                    body=req.body,
+                ),
+                data={"type": "broadcast"},
+                token=token,
+                android=messaging.AndroidConfig(
+                    notification=messaging.AndroidNotification(
+                        channel_id="daily_picks",
+                    ),
+                ),
+                apns=messaging.APNSConfig(
+                    headers={
+                        "apns-priority": "10",
+                        "apns-push-type": "alert",
+                    },
+                    payload=messaging.APNSPayload(
+                        aps=messaging.Aps(
+                            alert=messaging.ApsAlert(
+                                title=req.title,
+                                body=req.body,
+                            ),
+                            sound="default",
+                            badge=1,
+                        ),
+                    ),
+                ),
+            ))
+            sent += 1
+            per_token.append({
+                "token_full": token,
+                "token_preview": token_preview,
+                "status": "sent",
+                "message_id": message_id,
+                "delivered_via": "APNs" if "%" in message_id else "FCM(Android)",
+            })
+            logger.info(
+                "Targeted send: uid=%s email=%s token=%s message_id=%s",
+                req.uid, email, token_preview, message_id,
+            )
+        except messaging.UnregisteredError as e:
+            stale.append(token)
+            per_token.append({
+                "token_full": token,
+                "token_preview": token_preview,
+                "status": "stale",
+                "error": str(e),
+            })
+            logger.warning(
+                "Targeted send stale token: uid=%s email=%s token=%s",
+                req.uid, email, token_preview,
+            )
+        except (messaging.ThirdPartyAuthError, messaging.SenderIdMismatchError) as e:
+            stale.append(token)
+            per_token.append({
+                "token_full": token,
+                "token_preview": token_preview,
+                "status": "stale",
+                "error": f"{type(e).__name__}: {e}",
+            })
+            logger.warning(
+                "Targeted send pruning unrecoverable token: uid=%s email=%s token=%s reason=%s",
+                req.uid, email, token_preview, type(e).__name__,
+            )
+        except Exception as e:
+            failed += 1
+            per_token.append({
+                "token_full": token,
+                "token_preview": token_preview,
+                "status": "failed",
+                "error": f"{type(e).__name__}: {e}",
+            })
+            logger.error(
+                "Targeted send failed: uid=%s email=%s token=%s error=%s",
+                req.uid, email, token_preview, e,
+            )
+
+    if stale:
+        firebase_db.collection(FCM_TOKENS_COLLECTION).document(req.uid).update({
+            "tokens": firestore.ArrayRemove(stale),
+        })
+
+    return {
+        "uid": req.uid,
+        "email": email,
+        "display_name": display_name,
+        "sent": sent,
+        "failed": failed,
+        "stale_tokens_cleaned": len(stale),
+        "tokens": per_token,
     }
 
 

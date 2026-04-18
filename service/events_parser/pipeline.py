@@ -65,7 +65,7 @@ def scrape_all_events(
 
     all_events.extend(scrape_partiful())
 
-    return all_events
+    return _filter_events_with_images(all_events)
 
 
 def _scrape_restaurants_for_user(
@@ -84,7 +84,7 @@ def _scrape_restaurants_for_user(
         max_per_cuisine=14,
     )
     restaurants = tag_dietary_matches(restaurants, dietary)
-    return restaurants
+    return _filter_events_with_images(restaurants)
 
 
 def _dedup(events: list[ScrapedEvent]) -> list[ScrapedEvent]:
@@ -101,6 +101,31 @@ def _dedup(events: list[ScrapedEvent]) -> list[ScrapedEvent]:
             seen_names.add(name_key)
         deduped.append(ev)
     return deduped
+
+
+def _has_usable_image(ev: ScrapedEvent) -> bool:
+    """
+    True only when the item has a real http(s) image_url. Applied to events
+    AND restaurants — anything without a usable image is dropped so the UI
+    never has to render a placeholder card.
+    """
+    url = (ev.image_url or "").strip().lower()
+    if not url or url in {"none", "null", "false"}:
+        return False
+    return url.startswith("http://") or url.startswith("https://")
+
+
+def _filter_events_with_images(events: list[ScrapedEvent]) -> list[ScrapedEvent]:
+    kept: list[ScrapedEvent] = []
+    dropped = 0
+    for ev in events:
+        if _has_usable_image(ev):
+            kept.append(ev)
+        else:
+            dropped += 1
+    if dropped:
+        print(f"  [filter] Dropped {dropped} event(s) without image_url")
+    return kept
 
 
 def run_pipeline(
@@ -186,7 +211,7 @@ def run_pipeline(
                 keyword=kw,
             )
             keyword_events.extend(tm_events)
-        keyword_events = _dedup(keyword_events)
+        keyword_events = _filter_events_with_images(_dedup(keyword_events))
         total_events += len(keyword_events)
         if keywords_list:
             print(f"  Cluster: {len(keywords_list)} keywords -> {len(keyword_events)} extra events")

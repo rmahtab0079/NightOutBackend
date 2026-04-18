@@ -199,3 +199,88 @@ def clear_user_curated_events() -> int:
     if deleted:
         print(f"  [firebase] Deleted {deleted} documents from user_curated_events")
     return deleted
+
+
+def _doc_is_stale_event(event: dict) -> tuple[bool, str]:
+    """
+    Return (True, reason) if the catalog entry should be purged. Items are
+    considered stale when:
+      - they are an event whose date is in the past, OR
+      - they have no usable http(s) image_url (applies to events AND restaurants)
+    """
+    from datetime import datetime as _dt, timezone as _tz
+
+    image_url_raw = (event.get("image_url") or "").strip()
+    image_url_lower = image_url_raw.lower()
+    has_usable_image = (
+        bool(image_url_raw)
+        and image_url_lower not in {"none", "null", "false"}
+        and (
+            image_url_lower.startswith("http://")
+            or image_url_lower.startswith("https://")
+        )
+    )
+    if not has_usable_image:
+        return True, "no_image"
+
+    date_str = (event.get("date") or "").strip()
+    if not date_str:
+        return False, ""
+
+    time_str = (event.get("time") or "").strip()
+    now_utc = _dt.now(_tz.utc)
+
+    if time_str:
+        iso = f"{date_str}T{time_str}"
+        if iso.endswith("Z"):
+            iso = iso[:-1] + "+00:00"
+        try:
+            dt = _dt.fromisoformat(iso)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=_tz.utc)
+            if dt.astimezone(_tz.utc) < now_utc:
+                return True, "past"
+            return False, ""
+        except ValueError:
+            pass
+
+    try:
+        event_date = _dt.strptime(date_str[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return False, ""
+    if event_date < now_utc.date():
+        return True, "past"
+    return False, ""
+
+
+def purge_stale_parsed_events() -> dict:
+    """
+    Remove entries from parsed_events_catalog whose event date is in the past
+    or whose event has no `image_url`. Safe to run anytime; restaurants (no
+    `date`) are never touched.
+    """
+    db = _get_db()
+    coll = db.collection(PARSED_EVENTS_CATALOG_COLLECTION)
+    deleted_past = 0
+    deleted_no_image = 0
+    kept = 0
+    for doc in coll.stream():
+        data = doc.to_dict() or {}
+        is_stale, reason = _doc_is_stale_event(data)
+        if is_stale:
+            doc.reference.delete()
+            if reason == "past":
+                deleted_past += 1
+            elif reason == "no_image":
+                deleted_no_image += 1
+        else:
+            kept += 1
+    print(
+        f"  [firebase] parsed_events_catalog purge: "
+        f"kept {kept}, removed {deleted_past} past, {deleted_no_image} imageless"
+    )
+    return {
+        "kept": kept,
+        "deleted_past": deleted_past,
+        "deleted_no_image": deleted_no_image,
+    }

@@ -5,7 +5,7 @@ SERVICE ?= nightout-backend
 DOTENV_SECRET ?= app-dotenv
 DOTENV_MOUNT_PATH ?= /var/secrets/.env
 
-.PHONY: run docker-create docker-build deploy gcp-enable-apis dotenv-secret-create dotenv-upload cloud-run-update-dotenv secret-grant-access
+.PHONY: run docker-create docker-build deploy redeploy gcp-enable-apis dotenv-secret-create dotenv-upload cloud-run-update-dotenv secret-grant-access
 
 run:
 	uvicorn application:app --host 0.0.0.0 --port 8000 --reload
@@ -18,6 +18,34 @@ docker-build:
 
 deploy:
 	gcloud run deploy nightout-backend --image $(IMAGE) --project $(PROJECT) --region $(REGION) --allow-unauthenticated --quiet
+
+# One-shot: rebuild image, push to Artifact Registry, and deploy to Cloud Run.
+# Use this whenever you've changed application.py and want the new code live.
+redeploy: docker-build deploy
+	@echo "Cloud Run service redeployed with latest code."
+
+# Read recent Cloud Run logs (most recent 100 lines, newest last).
+logs:
+	gcloud logging read \
+		'resource.type="cloud_run_revision" AND resource.labels.service_name="$(SERVICE)"' \
+		--project $(PROJECT) \
+		--limit 100 \
+		--order=asc \
+		--format='value(timestamp,severity,textPayload,jsonPayload.message)'
+
+# Live-tail all Cloud Run logs via Cloud Logging.
+logs-tail:
+	gcloud logging tail \
+		'resource.type="cloud_run_revision" AND resource.labels.service_name="$(SERVICE)"' \
+		--project $(PROJECT) \
+		--format='value(timestamp,severity,textPayload,jsonPayload.message)'
+
+# Stream only push-broadcast log lines via Cloud Logging.
+logs-broadcast:
+	gcloud logging tail \
+		'resource.type="cloud_run_revision" AND resource.labels.service_name="$(SERVICE)" AND "Broadcast"' \
+		--project $(PROJECT) \
+		--format='value(timestamp,textPayload,jsonPayload.message)'
 
 # ---- Secret Manager .env workflow ----
 gcp-enable-apis:
@@ -226,8 +254,9 @@ broadcast:
 	curl -s -X POST "$$SERVICE_URL/admin/broadcast_notification" \
 		-H "X-Admin-Token: $$ADMIN_TOKEN" \
 		-H "Content-Type: application/json" \
-		-d '{"title": "Welcome to Boredom Destroyer! 🎉", "body": "Your personalized picks are ready. Open the app to explore events, food, movies & more near you!"}' ; \
-	echo ""
+		-d '{"title": "Welcome to Boredom Destroyer! 🎉", "body": "Your personalized picks are ready. Open the app to explore events, food, movies & more near you!"}' \
+		| python3 -m json.tool 2>/dev/null || cat
+	@echo ""
 
 broadcast-custom:
 	@if [ -z "$(TITLE)" ] || [ -z "$(BODY)" ]; then \
@@ -241,5 +270,64 @@ broadcast-custom:
 	curl -s -X POST "$$SERVICE_URL/admin/broadcast_notification" \
 		-H "X-Admin-Token: $$ADMIN_TOKEN" \
 		-H "Content-Type: application/json" \
-		-d "{\"title\": \"$(TITLE)\", \"body\": \"$(BODY)\"}" ; \
-	echo ""
+		-d "{\"title\": \"$(TITLE)\", \"body\": \"$(BODY)\"}" \
+		| python3 -m json.tool 2>/dev/null || cat
+
+# Send a push to a single user (debug helper).
+# Usage: make broadcast-uid UID=O8vlCicmZXWZ44zcoqo2UMevdoE2 [TITLE=... BODY=...]
+broadcast-uid:
+	@if [ -z "$(UID)" ]; then \
+		echo "Usage: make broadcast-uid UID=<firebase-uid> [TITLE=... BODY=...]"; \
+		exit 1; \
+	fi
+	@TITLE_ARG="$(TITLE)"; if [ -z "$$TITLE_ARG" ]; then TITLE_ARG="iOS push debug"; fi; \
+	BODY_ARG="$(BODY)";   if [ -z "$$BODY_ARG"  ]; then BODY_ARG="If you can read this, APNs delivery is working."; fi; \
+	ADMIN_TOKEN=$$(grep ADMIN_RECS_TOKEN .env 2>/dev/null | cut -d= -f2); \
+	if [ -z "$$ADMIN_TOKEN" ]; then echo "ERROR: Set ADMIN_RECS_TOKEN in .env first"; exit 1; fi; \
+	SERVICE_URL=$$(gcloud run services describe $(SERVICE) \
+		--project $(PROJECT) --region $(REGION) --format='value(status.url)'); \
+	curl -s -X POST "$$SERVICE_URL/admin/broadcast_to_uid" \
+		-H "X-Admin-Token: $$ADMIN_TOKEN" \
+		-H "Content-Type: application/json" \
+		-d "{\"uid\": \"$(UID)\", \"title\": \"$$TITLE_ARG\", \"body\": \"$$BODY_ARG\"}" \
+		| python3 -m json.tool 2>/dev/null || cat
+	@echo ""
+
+# Wipe ALL FCM tokens for one user from Firestore (forces a re-register on
+# next app launch). Run this if you suspect stale/orphaned tokens.
+purge-tokens-uid:
+	@if [ -z "$(UID)" ]; then \
+		echo "Usage: make purge-tokens-uid UID=<firebase-uid>"; \
+		exit 1; \
+	fi
+	@echo "Deleting Firestore doc user_fcm_tokens/$(UID) ..."
+	@gcloud firestore documents delete \
+		"projects/nightoutclient-7931e/databases/(default)/documents/user_fcm_tokens/$(UID)" \
+		--quiet || echo "(doc may not have existed)"
+	@echo "Done. Now reopen the app on your iPhone so it re-registers a fresh token."
+	@echo ""
+
+# Wipe ALL FCM tokens for ALL users. Forces every device to re-register on
+# next app launch. Use this when triaging push-delivery issues to eliminate
+# any chance of stale/orphaned tokens left over from prior builds.
+#
+# Skips the prompt if you pass YES=1 (e.g. `make purge-tokens-all YES=1`).
+purge-tokens-all:
+	@ADMIN_TOKEN=$$(grep ADMIN_RECS_TOKEN .env 2>/dev/null | cut -d= -f2); \
+	if [ -z "$$ADMIN_TOKEN" ]; then echo "ERROR: Set ADMIN_RECS_TOKEN in .env first"; exit 1; fi; \
+	SERVICE_URL=$$(gcloud run services describe $(SERVICE) \
+		--project $(PROJECT) --region $(REGION) --format='value(status.url)'); \
+	echo "Current token count BEFORE purge:"; \
+	curl -s "$$SERVICE_URL/admin/fcm_token_count" -H "X-Admin-Token: $$ADMIN_TOKEN" | python3 -m json.tool; \
+	if [ "$(YES)" != "1" ]; then \
+		printf "\nThis will delete ALL FCM tokens for ALL users. Type 'PURGE' to confirm: "; \
+		read CONFIRM; \
+		if [ "$$CONFIRM" != "PURGE" ]; then echo "Aborted."; exit 1; fi; \
+	fi; \
+	echo "Purging..."; \
+	curl -s -X POST "$$SERVICE_URL/admin/purge_all_fcm_tokens" \
+		-H "X-Admin-Token: $$ADMIN_TOKEN" \
+		-H "X-Confirm: PURGE" \
+		| python3 -m json.tool; \
+	echo ""; \
+	echo "Done. Every user must reopen the app to re-register a fresh token."

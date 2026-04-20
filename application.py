@@ -2241,6 +2241,39 @@ def _interleave_by_key(items: list[dict], key_fn) -> list[dict]:
     return result
 
 
+def _weighted_shuffle(items: list[dict], weight_fn) -> list[dict]:
+    """
+    Return ``items`` in a randomized order. Higher-``weight_fn`` items have
+    a bigger chance of being placed earlier in the result, but every item
+    can still appear anywhere — it's a soft bias, not a sort.
+
+    Implementation: assign each item a random key of ``random()**(1/weight)``
+    (Efraimidis–Spirakis weighted reservoir), then sort descending by key.
+    Items with weight ``<= 0`` get a tiny floor so they don't always sink
+    to the bottom.
+    """
+    import math
+
+    if not items:
+        return items
+
+    keyed: list[tuple[float, int, dict]] = []
+    for idx, item in enumerate(items):
+        try:
+            w = float(weight_fn(item))
+        except Exception:
+            w = 0.0
+        if w <= 0:
+            w = 0.01
+        # log-domain to avoid underflow when weight is large
+        u = random.random() or 1e-12
+        key = math.log(u) / w
+        keyed.append((key, idx, item))
+
+    keyed.sort(key=lambda t: t[0], reverse=True)
+    return [t[2] for t in keyed]
+
+
 def _interleave_by_category(events_by_cat: dict) -> list[dict]:
     """
     Build a round-robin list that alternates categories so the user
@@ -2309,6 +2342,15 @@ async def curated_event_pick(
             )
         else:
             candidates = _interleave_by_category(events_by_cat)
+
+        # Randomize the candidate order so the user doesn't see the same
+        # sequence on every refresh / "next" tap. We still want a slight
+        # bias toward higher-relevance picks, so we use a Fisher-Yates
+        # shuffle weighted by relevance_score (a small constant is added
+        # to avoid zero-weight items being permanently sunk to the end).
+        candidates = _weighted_shuffle(
+            candidates, weight_fn=lambda e: e.get("relevance_score", 0) or 0
+        )
 
         seen_names: set[str] = set()
         for event in candidates:

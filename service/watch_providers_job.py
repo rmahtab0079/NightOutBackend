@@ -52,6 +52,13 @@ PROVIDER_NAME_MAPPING = {
     "Crunchyroll": "Crunchyroll",
     "YouTube Premium": "YouTube Premium",
     "YouTube": "YouTube Premium",
+    # JustWatch / TMDB list Fubo under several brand variants depending on the
+    # title; collapse them all to the canonical "Fubo" so user prefs match.
+    "Fubo": "Fubo",
+    "fuboTV": "Fubo",
+    "Fubo TV": "Fubo",
+    "Fubo Sports": "Fubo",
+    "Fubo Sports Network": "Fubo",
 }
 
 

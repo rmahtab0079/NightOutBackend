@@ -59,14 +59,15 @@ async def run_events_parser(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/send_daily_picks")
-async def send_daily_picks(
+@app.post("/send_hourly_picks")
+async def send_hourly_picks(
     authorization: Optional[str] = Header(default=None),
 ):
     """
-    Compose and publish daily-picks push notifications for all users.
+    Compose and publish hourly-picks push notifications for all users.
 
-    Called by Cloud Scheduler at 6 PM ET daily, or manually via Makefile.
+    Called by Cloud Scheduler at the top of every hour ET, or manually via
+    Makefile (`make hourly-picks-trigger`).
     """
     cron_secret = os.getenv("EVENTS_PARSER_CRON_SECRET", "")
     if cron_secret:
@@ -74,19 +75,28 @@ async def send_daily_picks(
         if token != cron_secret:
             raise HTTPException(status_code=403, detail="Invalid cron secret")
 
-    from .notifications import compose_daily_picks, publish_daily_picks
+    from .notifications import compose_hourly_picks, publish_hourly_picks
 
     try:
-        payloads = compose_daily_picks()
-        published = publish_daily_picks(payloads)
+        payloads = compose_hourly_picks()
+        published = publish_hourly_picks(payloads)
         return {
             "status": "completed",
             "users_composed": len(payloads),
             "messages_published": published,
         }
     except Exception as e:
-        print(f"Daily picks error: {e}")
+        print(f"Hourly picks error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/send_daily_picks", deprecated=True)
+async def send_daily_picks_alias(
+    authorization: Optional[str] = Header(default=None),
+):
+    """Deprecated alias retained so the existing Cloud Scheduler call keeps
+    working until the URI is migrated to /send_hourly_picks."""
+    return await send_hourly_picks(authorization=authorization)
 
 
 def main():

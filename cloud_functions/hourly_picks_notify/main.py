@@ -1,8 +1,8 @@
 """
-Cloud Function: subscribes to Pub/Sub topic 'daily-picks' and sends FCM
-push notifications with each user's daily top picks.
+Cloud Function: subscribes to Pub/Sub topic 'hourly-picks' and sends FCM
+push notifications with each user's top picks.
 
-Trigger: Pub/Sub topic (daily-picks).
+Trigger: Pub/Sub topic (hourly-picks).
 Message payload: JSON with uid, title, body, data.
 """
 import json
@@ -17,23 +17,26 @@ _app_initialized = False
 
 
 def _get_firestore():
+    """Initialize Firebase Admin pointed at the Firebase project (which owns
+    Firestore + FCM), regardless of which GCP project this function runs in."""
     global _app_initialized
     if not _app_initialized:
         if not firebase_admin._apps:
-            project_id = os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("FIREBASE_PROJECT_ID")
-            svc_path = os.getenv("FIREBASE_SERVICE_ACCOUNT_PATH", "")
+            project_id = os.getenv("FIREBASE_PROJECT_ID", "nightoutclient-7931e")
+            svc_path = os.getenv("FIREBASE_SERVICE_ACCOUNT_PATH", "serviceAccount.json")
             if svc_path and os.path.exists(svc_path):
                 cred = credentials.Certificate(svc_path)
                 firebase_admin.initialize_app(cred, {"projectId": project_id})
             else:
-                firebase_admin.initialize_app()
+                print(f"WARNING: serviceAccount.json not found at {svc_path}; falling back to ADC")
+                firebase_admin.initialize_app(options={"projectId": project_id})
         _app_initialized = True
     return firestore.client()
 
 
-def daily_picks_notify(event, context):
+def hourly_picks_notify(event, context):
     """
-    Triggered by a Pub/Sub message on the daily-picks topic.
+    Triggered by a Pub/Sub message on the hourly-picks topic.
     Decodes the payload and sends an FCM notification to the user's devices.
     """
     try:
@@ -44,7 +47,7 @@ def daily_picks_notify(event, context):
         return
 
     uid = payload.get("uid")
-    title = payload.get("title", "Your daily picks are ready!")
+    title = payload.get("title", "Your hourly picks are ready!")
     body = payload.get("body", "Check out today's suggestions")
     data = payload.get("data", {})
 
@@ -77,7 +80,7 @@ def daily_picks_notify(event, context):
                     token=token,
                     android=messaging.AndroidConfig(
                         notification=messaging.AndroidNotification(
-                            channel_id="daily_picks",
+                            channel_id="hourly_picks",
                         ),
                     ),
                     apns=messaging.APNSConfig(

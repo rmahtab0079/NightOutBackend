@@ -187,7 +187,11 @@ def _score_restaurant(
     """
     score = 0.0
 
-    if user_lat is not None and user_lon is not None and event.latitude and event.longitude:
+    if user_lat is not None and user_lon is not None:
+        if not event.latitude or not event.longitude:
+            # Restaurants without coords cannot be proven nearby; reject so
+            # we never serve a New York place to a Chicago user.
+            return 0.0
         dist = _haversine_miles(user_lat, user_lon, event.latitude, event.longitude)
         if dist > max_radius_miles:
             return 0.0
@@ -255,6 +259,31 @@ def _keyword_match_bonus(
     return score
 
 
+def _first_keyword_hit(
+    event: ScrapedEvent, keywords: list[str]
+) -> Optional[str]:
+    """Return the first keyword (in original casing) found in the event text."""
+    if not keywords:
+        return None
+    text = f"{event.name} {event.description or ''}".lower()
+    for kw in keywords:
+        if kw and kw.lower() in text:
+            return kw
+    return None
+
+
+# Per-match score bumps. Artists rank higher than teams so a "Taylor Swift"
+# show always outranks a generic Knicks game in the Featured carousel.
+_ARTIST_BONUS_PER_MATCH = 3.5
+_TEAM_BONUS_PER_MATCH = 1.8
+
+# Fans will travel a couple of hours for a favorite artist or team. The
+# generic radius (set by the caller, usually 30-50 mi) is too tight for arena
+# tours that cluster around regional metros, so artist/team-tagged events get
+# this wider gate before being rejected as "too far".
+_KEYWORD_EVENT_RADIUS_MILES = 150.0
+
+
 def score_event_for_user(
     event: ScrapedEvent,
     user_interests: list[str],
@@ -286,11 +315,33 @@ def score_event_for_user(
 
     score = 0.0
 
+    # Pre-check: was this event scraped by an artist/team keyword? If so it
+    # gets a wider proximity gate (concert tours cluster around regional
+    # metros and fans drive 1-2 hours).
+    pre_tagged_artist = getattr(event, "_matched_artist", None)
+    is_keyword_event = bool(
+        pre_tagged_artist
+        or _first_keyword_hit(event, user_favorite_artists or [])
+        or _first_keyword_hit(event, user_favorite_teams or [])
+    )
+    effective_radius = (
+        max(max_radius_miles, _KEYWORD_EVENT_RADIUS_MILES)
+        if is_keyword_event
+        else max_radius_miles
+    )
+
     # --- Proximity ---
-    if user_lat is not None and user_lon is not None and event.latitude and event.longitude:
-        dist = _haversine_miles(user_lat, user_lon, event.latitude, event.longitude)
-        if dist > max_radius_miles:
+    if user_lat is not None and user_lon is not None:
+        if not event.latitude or not event.longitude:
+            # No way to verify the event is anywhere near the user. Historically
+            # Eventbrite/Partiful events without coords were the main vector for
+            # cross-city contamination -- reject them outright.
             return 0.0
+        dist = _haversine_miles(user_lat, user_lon, event.latitude, event.longitude)
+        if dist > effective_radius:
+            return 0.0
+        # Distance score uses the *base* radius so a normal event 5 mi away
+        # still scores higher than a keyword event 60 mi away.
         score += max(0, 1.0 - dist / max_radius_miles) * 0.3
 
     # --- Content relevance ---
@@ -308,8 +359,19 @@ def score_event_for_user(
     tag_overlap = event_tags_lower & user_interests_lower
     score += len(tag_overlap) * 1.5
 
-    score += _keyword_match_bonus(event, user_favorite_teams or [], bonus_per_match=1.8)
-    score += _keyword_match_bonus(event, user_favorite_artists or [], bonus_per_match=1.8)
+    score += _keyword_match_bonus(
+        event, user_favorite_teams or [], bonus_per_match=_TEAM_BONUS_PER_MATCH
+    )
+    score += _keyword_match_bonus(
+        event, user_favorite_artists or [], bonus_per_match=_ARTIST_BONUS_PER_MATCH
+    )
+
+    # Stamp the matched artist on the event so downstream code (artist_picks
+    # extraction) doesn't have to re-run substring matching. Treat the field
+    # as opaque metadata; ScrapedEvent.to_dict() preserves it.
+    matched_artist = _first_keyword_hit(event, user_favorite_artists or [])
+    if matched_artist:
+        event._matched_artist = matched_artist  # type: ignore[attr-defined]
 
     food_tags = {"food", "restaurant", "brunch", "dinner", "drinks", "wine", "coffee", "brewery"}
     if event_tags_lower & food_tags:
@@ -430,5 +492,51 @@ def group_events_by_category(
         entry["relevance_score"] = round(score, 2)
         if getattr(event, "_is_novelty", False):
             entry["is_novelty"] = True
+        matched_artist = getattr(event, "_matched_artist", None)
+        if matched_artist:
+            entry["matched_artist"] = matched_artist
         groups.setdefault(cat, []).append(entry)
     return groups
+
+
+def extract_artist_picks(
+    matched: list[tuple[ScrapedEvent, float]],
+    favorite_artists: list[str],
+    *,
+    max_picks: int = 8,
+) -> list[dict]:
+    """
+    Pull out the matched events that hit a user-favorite artist, sorted by
+    relevance. These power the home screen's "Artists You Love" carousel.
+
+    Dedup is by (source, source_id) so the same Taylor Swift show doesn't
+    appear twice if it was scraped under multiple keyword variants.
+    """
+    if not favorite_artists or not matched:
+        return []
+
+    # Use a normalized list so callers can pass arbitrary casings.
+    favorites_norm = [a for a in favorite_artists if a and a.strip()]
+    if not favorites_norm:
+        return []
+
+    seen: set[str] = set()
+    picks: list[dict] = []
+    for event, score in matched:
+        artist = getattr(event, "_matched_artist", None) or _first_keyword_hit(
+            event, favorites_norm
+        )
+        if not artist:
+            continue
+        key = f"{event.source}:{event.source_id}"
+        if key in seen:
+            continue
+        seen.add(key)
+        entry = event.to_dict()
+        entry["relevance_score"] = round(score, 2)
+        entry["is_artist_pick"] = True
+        entry["matched_artist"] = artist
+        picks.append(entry)
+
+    picks.sort(key=lambda e: e.get("relevance_score", 0.0), reverse=True)
+    return picks[:max_picks]

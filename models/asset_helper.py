@@ -24,7 +24,14 @@ from typing import List
 # )
 
 BASE_IMAGE_URL = "https://image.tmdb.org/t/p/"
-DEFAULT_IMAGE_SIZE = "w200"  # Customize based on required size (e.g., "original", "w300", etc.)
+# TMDB poster sizes: w92, w154, w185, w342, w500, w780, original.
+# w200 (the historical default) is a 200-pixel-wide JPEG, which looks soft
+# when stretched across a modern 3x phone hero. w780 is roughly 4x the pixel
+# count and the largest dedicated poster size short of `original`.
+DEFAULT_IMAGE_SIZE = "w780"
+# TMDB backdrop sizes: w300, w780, w1280, original. Hero images render
+# landscape, so use the widest dedicated size.
+DEFAULT_BACKDROP_SIZE = "w1280"
 
 
 def _extract_year(date_str: str) -> int | None:
@@ -123,7 +130,8 @@ def get_assets(
 
 def get_assets_page(api_key, page, results_queue, asset_type: str):
     base_image_url = os.getenv("BASE_IMAGE_URL") or BASE_IMAGE_URL
-    default_image_size = os.getenv("DEFAULT_IMAGE_SIZE") or DEFAULT_IMAGE_SIZE
+    poster_size = os.getenv("DEFAULT_IMAGE_SIZE") or DEFAULT_IMAGE_SIZE
+    backdrop_size = os.getenv("DEFAULT_BACKDROP_SIZE") or DEFAULT_BACKDROP_SIZE
     url = f"https://api.themoviedb.org/3/{asset_type}/top_rated?language=en-US&page={page}&api_key={api_key}"
     #url = f"https://api.themoviedb.org/3/discover/movie?include_adult=false&include_video=false&language=en-US&page=1&sort_by=popularity.desc&api_key={tmdb_api_key}"
     response = requests.get(url)
@@ -132,10 +140,18 @@ def get_assets_page(api_key, page, results_queue, asset_type: str):
         data = response.json()
         movies = []
         for movie in data.get("results", []):
-            backdrop_path = movie.get("poster_path")
+            poster_path = movie.get("poster_path")
+            if poster_path:
+                movie["poster_url"] = f"{base_image_url}{poster_size}{poster_path}"
+                # Also expose the original-resolution URL so very high-DPI
+                # devices can opt into it without another roundtrip.
+                movie["poster_url_original"] = f"{base_image_url}original{poster_path}"
+            backdrop_path = movie.get("backdrop_path")
             if backdrop_path:
-                # Construct the full backdrop image URL
-                movie["poster_url"] = f"{base_image_url}{default_image_size}{backdrop_path}"
+                # Backdrops are landscape and a much better hero source than
+                # the squarish poster on a phone in portrait orientation.
+                movie["backdrop_url"] = f"{base_image_url}{backdrop_size}{backdrop_path}"
+                movie["backdrop_url_original"] = f"{base_image_url}original{backdrop_path}"
             if movie["original_language"] == "en":
                 movies.append(movie)
         # Add the modified response to the queue

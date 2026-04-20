@@ -14,7 +14,10 @@ else:
     load_dotenv()
 
 BASE_IMAGE_URL = "https://image.tmdb.org/t/p/"
-DEFAULT_IMAGE_SIZE = "w200"  # Customize based on required size (e.g., "original", "w300", etc.)
+# Match the size used by `models/asset_helper.py` so the parquet snapshots and
+# the live API both serve the same crisp poster URL.
+DEFAULT_IMAGE_SIZE = "w780"
+DEFAULT_BACKDROP_SIZE = "w1280"
 
 
 def write_tv_df():
@@ -73,6 +76,25 @@ def read_movies_df():
     return print(len(df))
 
 
+def _stamp_image_urls(movie: dict) -> None:
+    """Attach high-resolution poster + backdrop URLs to a TMDB movie dict.
+
+    Stamps four fields:
+    - poster_url           (DEFAULT_IMAGE_SIZE, ~w780)
+    - poster_url_original  (full-resolution)
+    - backdrop_url         (DEFAULT_BACKDROP_SIZE, ~w1280)
+    - backdrop_url_original
+    """
+    poster_path = movie.get("poster_path")
+    if poster_path:
+        movie["poster_url"] = f"{BASE_IMAGE_URL}{DEFAULT_IMAGE_SIZE}{poster_path}"
+        movie["poster_url_original"] = f"{BASE_IMAGE_URL}original{poster_path}"
+    backdrop_path = movie.get("backdrop_path")
+    if backdrop_path:
+        movie["backdrop_url"] = f"{BASE_IMAGE_URL}{DEFAULT_BACKDROP_SIZE}{backdrop_path}"
+        movie["backdrop_url_original"] = f"{BASE_IMAGE_URL}original{backdrop_path}"
+
+
 def get_tv_page(api_key, page, results_queue):
     # Small delay to avoid hitting API rate limits
     time.sleep(1)
@@ -83,10 +105,7 @@ def get_tv_page(api_key, page, results_queue):
         # Parse JSON response
         data = response.json()
         for movie in data.get("results", []):
-            backdrop_path = movie.get("poster_path")
-            if backdrop_path:
-                # Construct the full backdrop image URL
-                movie["poster_url"] = f"{BASE_IMAGE_URL}{DEFAULT_IMAGE_SIZE}{backdrop_path}"
+            _stamp_image_urls(movie)
         # Add the modified response to the queue
         results_queue.put(data)
 
@@ -104,10 +123,7 @@ def get_movies_page(api_key, page, results_queue, asset_type: str):
         # Parse JSON response
         data = response.json()
         for movie in data.get("results", []):
-            backdrop_path = movie.get("poster_path")
-            if backdrop_path:
-                # Construct the full backdrop image URL
-                movie["poster_url"] = f"{BASE_IMAGE_URL}{DEFAULT_IMAGE_SIZE}{backdrop_path}"
+            _stamp_image_urls(movie)
         # Add the modified response to the queue
         results_queue.put(data)
         print("Successfully fetched a movie page")

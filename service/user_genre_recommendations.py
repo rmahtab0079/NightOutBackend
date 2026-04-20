@@ -320,6 +320,15 @@ def precompute_user_genre_recommendations_for_email(
     _set_recommendations(db, email, movie_recs if movie_recs else {}, tv_recs if tv_recs else {})
     print(f"Updated genre recommendations for {email}")
 
+    # New movie/tv recs invalidate the cached home payload -- re-emit so the
+    # Flutter client sees fresh picks via its Firestore stream.
+    try:
+        from service.home_payload import write_home_payload_safe
+
+        write_home_payload_safe(email)
+    except Exception as e:
+        print(f"home_payload refresh failed for {email}: {e}")
+
 
 def precompute_all_user_genre_recommendations(limit_per_genre: int = 100) -> None:
     db = _get_firestore_client()
@@ -383,6 +392,19 @@ def precompute_all_user_genre_recommendations(limit_per_genre: int = 100) -> Non
         batch.commit()
     total_elapsed = time.time() - start_time
     print(f"Completed genre precompute for {total_users} users in {total_elapsed:.1f}s")
+
+    # After all genre recs are flushed, refresh every user's home payload so
+    # their next home open picks up the new movies/tv via the live stream.
+    try:
+        from service.home_payload import write_home_payload_safe
+
+        for user in users:
+            user_doc = user.to_dict() or {}
+            email = user_doc.get("email") or user.id
+            if email:
+                write_home_payload_safe(email)
+    except Exception as e:
+        print(f"home_payload bulk refresh failed: {e}")
 
 
 def start_genre_recommendation_scheduler(interval_seconds: int = 300) -> None:

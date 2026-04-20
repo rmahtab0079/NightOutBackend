@@ -125,7 +125,7 @@ events-parser-deploy:
 		--image $(EVENTS_PARSER_IMAGE) \
 		--no-allow-unauthenticated \
 		--set-secrets=$(DOTENV_MOUNT_PATH)=$(DOTENV_SECRET):latest \
-		--update-env-vars DOTENV_PATH=$(DOTENV_MOUNT_PATH) \
+		--update-env-vars DOTENV_PATH=$(DOTENV_MOUNT_PATH),PUBSUB_PROJECT_ID=$(PROJECT),GOOGLE_CLOUD_PROJECT=$(PROJECT) \
 		--cpu 1 \
 		--memory 512Mi \
 		--max-instances 1 \
@@ -159,56 +159,61 @@ events-parser-trigger:
 		-H "Authorization: Bearer $$(gcloud auth print-identity-token)" \
 		-H "Content-Type: application/json"
 
-# ---- Daily Picks Push Notifications ----
-DAILY_PICKS_TOPIC := daily-picks
+# ---- Hourly Picks Push Notifications ----
+HOURLY_PICKS_TOPIC := hourly-picks
 
-daily-picks-create-topic:
-	@echo "Creating Pub/Sub topic $(DAILY_PICKS_TOPIC)..."
-	@gcloud pubsub topics create $(DAILY_PICKS_TOPIC) --project $(PROJECT) --quiet 2>/dev/null || \
-		echo "Topic $(DAILY_PICKS_TOPIC) already exists."
+hourly-picks-create-topic:
+	@echo "Creating Pub/Sub topic $(HOURLY_PICKS_TOPIC)..."
+	@gcloud pubsub topics create $(HOURLY_PICKS_TOPIC) --project $(PROJECT) --quiet 2>/dev/null || \
+		echo "Topic $(HOURLY_PICKS_TOPIC) already exists."
 
-daily-picks-create-scheduler:
-	@echo "Creating Cloud Scheduler job to send daily picks at 6 PM ET..."
+hourly-picks-create-scheduler:
+	@echo "Creating Cloud Scheduler job to send hourly picks at the top of every hour..."
 	@SERVICE_URL=$$(gcloud run services describe $(EVENTS_PARSER_SERVICE) \
 		--project $(PROJECT) --region $(REGION) --format='value(status.url)'); \
 	SA_EMAIL=$$(gcloud projects describe $(PROJECT) --format='value(projectNumber)'); \
 	SA_EMAIL="$$SA_EMAIL-compute@developer.gserviceaccount.com"; \
-	gcloud scheduler jobs create http daily-picks-cron \
+	gcloud scheduler jobs create http hourly-picks-cron \
 		--project $(PROJECT) \
 		--location $(REGION) \
-		--schedule "0 18 * * *" \
-		--uri "$$SERVICE_URL/send_daily_picks" \
+		--schedule "0 * * * *" \
+		--uri "$$SERVICE_URL/send_hourly_picks" \
 		--http-method POST \
 		--oidc-service-account-email "$$SA_EMAIL" \
 		--oidc-token-audience "$$SERVICE_URL" \
 		--time-zone "America/New_York" \
 		--attempt-deadline 300s \
 		--quiet
-	@echo "Scheduler created: runs daily at 6 PM ET."
+	@echo "Scheduler created: runs every hour (top of the hour, ET)."
 
-daily-picks-trigger:
+hourly-picks-trigger:
 	@SERVICE_URL=$$(gcloud run services describe $(EVENTS_PARSER_SERVICE) \
 		--project $(PROJECT) --region $(REGION) --format='value(status.url)'); \
-	curl -X POST "$$SERVICE_URL/send_daily_picks" \
+	curl -X POST "$$SERVICE_URL/send_hourly_picks" \
 		-H "Authorization: Bearer $$(gcloud auth print-identity-token)" \
 		-H "Content-Type: application/json"
 
-daily-picks-deploy-function:
-	@echo "Deploying daily_picks_notify Cloud Function..."
-	gcloud functions deploy daily_picks_notify \
+hourly-picks-deploy-function:
+	@echo "Deploying hourly_picks_notify Cloud Function..."
+	@test -f serviceAccount.json || (echo "Error: serviceAccount.json missing in repo root" && exit 1)
+	@cp serviceAccount.json cloud_functions/hourly_picks_notify/serviceAccount.json
+	@trap 'rm -f cloud_functions/hourly_picks_notify/serviceAccount.json' EXIT; \
+	gcloud functions deploy hourly_picks_notify \
 		--project $(PROJECT) \
 		--region $(REGION) \
 		--runtime python312 \
-		--trigger-topic $(DAILY_PICKS_TOPIC) \
-		--entry-point daily_picks_notify \
-		--source cloud_functions/daily_picks_notify \
+		--trigger-topic $(HOURLY_PICKS_TOPIC) \
+		--entry-point hourly_picks_notify \
+		--source cloud_functions/hourly_picks_notify \
+		--set-env-vars FIREBASE_PROJECT_ID=nightoutclient-7931e,FIREBASE_SERVICE_ACCOUNT_PATH=serviceAccount.json \
 		--memory 256MB \
 		--timeout 60s \
 		--quiet
+	@rm -f cloud_functions/hourly_picks_notify/serviceAccount.json
 	@echo "Cloud Function deployed."
 
-daily-picks-setup: daily-picks-create-topic daily-picks-deploy-function daily-picks-create-scheduler
-	@echo "Daily picks notification system fully set up."
+hourly-picks-setup: hourly-picks-create-topic hourly-picks-deploy-function hourly-picks-create-scheduler
+	@echo "Hourly picks notification system fully set up."
 
 # ---- Friend Activity Notifications ----
 FRIEND_ACTIVITY_TOPIC := friend-activity
@@ -245,6 +250,17 @@ check-tokens:
 		-H "X-Admin-Token: $$ADMIN_TOKEN" ; \
 	echo ""
 
+# Pretty-print every user that has registered an FCM token, with UID + email +
+# token count. Useful for grabbing a UID to plug into `make broadcast-uid`.
+list-tokens:
+	@ADMIN_TOKEN=$$(grep ADMIN_RECS_TOKEN .env 2>/dev/null | cut -d= -f2); \
+	if [ -z "$$ADMIN_TOKEN" ]; then echo "ERROR: Set ADMIN_RECS_TOKEN in .env first"; exit 1; fi; \
+	SERVICE_URL=$$(gcloud run services describe $(SERVICE) \
+		--project $(PROJECT) --region $(REGION) --format='value(status.url)'); \
+	curl -s "$$SERVICE_URL/admin/list_fcm_tokens" \
+		-H "X-Admin-Token: $$ADMIN_TOKEN" \
+		| python3 -m json.tool
+
 broadcast:
 	@echo "Sending broadcast push notification to all registered users..."
 	@ADMIN_TOKEN=$$(grep ADMIN_RECS_TOKEN .env 2>/dev/null | cut -d= -f2); \
@@ -254,7 +270,7 @@ broadcast:
 	curl -s -X POST "$$SERVICE_URL/admin/broadcast_notification" \
 		-H "X-Admin-Token: $$ADMIN_TOKEN" \
 		-H "Content-Type: application/json" \
-		-d '{"title": "Welcome to Boredom Destroyer! 🎉", "body": "Your personalized picks are ready. Open the app to explore events, food, movies & more near you!"}' \
+		-d '{"title": "In Or Out?", "body": "Your personalized picks are ready. Open the app to explore events, food, movies & more near you!"}' \
 		| python3 -m json.tool 2>/dev/null || cat
 	@echo ""
 

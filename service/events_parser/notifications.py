@@ -1,5 +1,5 @@
 """
-Compose and publish daily-picks notifications for all users.
+Compose and publish hourly-picks notifications for all users.
 
 Reads each user's curated events from Firestore, picks the top item per
 category, and publishes a Pub/Sub message per user for the Cloud Function
@@ -67,7 +67,7 @@ def _top_pick_name(events: list[dict]) -> Optional[str]:
     return best.get("name") or best.get("title") or None
 
 
-def compose_daily_picks() -> list[dict]:
+def compose_hourly_picks() -> list[dict]:
     """
     For every user with curated events, compose a notification payload.
     Returns a list of dicts: { uid, email, title, body, data }.
@@ -115,10 +115,10 @@ def compose_daily_picks() -> list[dict]:
         payloads.append({
             "uid": uid,
             "email": email,
-            "title": "Your daily picks are ready!",
+            "title": "Your hourly picks are ready!",
             "body": body,
             "data": {
-                "type": "daily_picks",
+                "type": "hourly_picks",
                 **top_data,
             },
         })
@@ -126,29 +126,66 @@ def compose_daily_picks() -> list[dict]:
     return payloads
 
 
-def publish_daily_picks(payloads: list[dict]) -> int:
+def _resolve_pubsub_project_id() -> Optional[str]:
+    """Resolve the GCP project id that owns the Pub/Sub topic.
+
+    NOTE: This is the *GCP* project (e.g. ``optimal-aegis-470701-j8``), not
+    the Firebase project (``nightoutclient-7931e``). Cloud Run does not set
+    ``GOOGLE_CLOUD_PROJECT`` automatically, so we fall back to ADC and the
+    metadata server before giving up.
+    """
+    pid = (
+        os.getenv("PUBSUB_PROJECT_ID")
+        or os.getenv("GOOGLE_CLOUD_PROJECT")
+        or os.getenv("GCP_PROJECT")
+    )
+    if pid:
+        return pid
+    try:
+        import google.auth
+        _, detected = google.auth.default()
+        if detected:
+            return detected
+    except Exception as e:
+        print(f"google.auth.default() failed: {e}")
+    return "optimal-aegis-470701-j8"
+
+
+def publish_hourly_picks(payloads: list[dict]) -> int:
     """Publish one Pub/Sub message per user. Returns the count published."""
     publisher = _get_publisher()
     if not publisher:
         print("No Pub/Sub publisher available — skipping publish")
         return 0
 
-    project_id = os.getenv("FIREBASE_PROJECT_ID", os.getenv("GOOGLE_CLOUD_PROJECT"))
-    topic_name = os.getenv("PUBSUB_DAILY_PICKS_TOPIC", "daily-picks")
+    project_id = _resolve_pubsub_project_id()
+    topic_name = os.getenv(
+        "PUBSUB_HOURLY_PICKS_TOPIC",
+        os.getenv("PUBSUB_DAILY_PICKS_TOPIC", "hourly-picks"),
+    )
     if not project_id:
         print("No project ID configured — skipping publish")
         return 0
 
     topic_path = publisher.topic_path(project_id, topic_name)
+    print(f"Publishing {len(payloads)} hourly picks to {topic_path}")
     published = 0
+    futures = []
 
     for payload in payloads:
         try:
             message = json.dumps(payload).encode("utf-8")
-            publisher.publish(topic_path, message)
-            published += 1
+            futures.append((payload, publisher.publish(topic_path, message)))
         except Exception as e:
             print(f"Failed to publish for {payload.get('email')}: {e}")
 
-    print(f"Published {published}/{len(payloads)} daily pick notifications")
+    for payload, fut in futures:
+        try:
+            msg_id = fut.result(timeout=30)
+            published += 1
+            print(f"Published msg_id={msg_id} for {payload.get('email')}")
+        except Exception as e:
+            print(f"Publish ack failed for {payload.get('email')}: {e}")
+
+    print(f"Published {published}/{len(payloads)} hourly pick notifications")
     return published

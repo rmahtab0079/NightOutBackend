@@ -1,0 +1,45 @@
+rules_version = '2';
+
+// Firestore security rules for NightOut.
+//
+// Deploy via:
+//   firebase deploy --only firestore:rules
+// or paste into the Firebase Console under Firestore > Rules.
+//
+// Note: This file is intentionally narrow -- it documents the rules that
+// matter for the home_payload precompute pipeline. If your project already
+// has additional rules in the Firebase Console, MERGE these in rather than
+// overwriting wholesale.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Each user can read their own precomputed home payload, but no one
+    // (including the user) may write to it from the client. Writes happen
+    // only from the backend using the Admin SDK, which bypasses these rules.
+    match /user_home_payload/{email} {
+      allow read: if request.auth != null
+                  && request.auth.token.email == email;
+      allow write: if false;
+    }
+
+    // Mirror rule for curated events for parity. Backend Admin SDK writes;
+    // the user can read their own document.
+    match /user_curated_events/{email} {
+      allow read: if request.auth != null
+                  && request.auth.token.email == email;
+      allow write: if false;
+    }
+
+    // Genre recommendation caches -- read-only from the client.
+    match /user_genre_recommendations_movies/{email} {
+      allow read: if request.auth != null
+                  && request.auth.token.email == email;
+      allow write: if false;
+    }
+    match /user_genre_recommendations_tv/{email} {
+      allow read: if request.auth != null
+                  && request.auth.token.email == email;
+      allow write: if false;
+    }
+  }
+}

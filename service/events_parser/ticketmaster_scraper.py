@@ -41,6 +41,71 @@ def _encode_geohash(lat: float, lon: float, precision: int = 9) -> str:
     return "".join(result)
 
 
+# Cache attraction lookups for the lifetime of a process. Each pipeline run
+# resolves the same artist names many times (once per cluster), and TM allows
+# only ~5 req/sec on the public tier — caching cuts that load drastically.
+_ATTRACTION_ID_CACHE: dict[str, Optional[str]] = {}
+
+
+def resolve_attraction_id(name: str) -> Optional[str]:
+    """
+    Look up the Ticketmaster attractionId for an artist/performer name.
+
+    Returns the id of the highest-relevance ATTRACTION matching `name` whose
+    own name is a reasonable match (case-insensitive substring either way).
+    Returns None if TM returns nothing or the closest hit is unrelated.
+
+    Caching is in-process only; safe across threads since dict.setdefault is
+    atomic in CPython.
+    """
+    api_key = os.getenv("TICKETMASTER_API_KEY", "")
+    if not api_key or not name or not name.strip():
+        return None
+    key = name.strip().lower()
+    if key in _ATTRACTION_ID_CACHE:
+        return _ATTRACTION_ID_CACHE[key]
+
+    try:
+        resp = requests.get(
+            "https://app.ticketmaster.com/discovery/v2/attractions.json",
+            params={
+                "apikey": api_key,
+                "keyword": name.strip(),
+                "size": "5",
+                "sort": "relevance,desc",
+            },
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            print(f"[ticketmaster] attractions returned {resp.status_code} for {name!r}")
+            _ATTRACTION_ID_CACHE[key] = None
+            return None
+        attractions = (resp.json().get("_embedded") or {}).get("attractions", [])
+        normalized_query = key
+        for attraction in attractions:
+            attraction_name = (attraction.get("name") or "").strip().lower()
+            if not attraction_name:
+                continue
+            # Accept either direction of substring match so "AC/DC" matches
+            # "AC/DC", "Beyoncé" matches "Beyoncé", and "Bad Bunny" matches
+            # "Bad Bunny" while also rejecting tribute acts like "ABBA Tribute"
+            # being returned for "ABBA".
+            if (
+                normalized_query in attraction_name
+                or attraction_name in normalized_query
+            ):
+                aid = attraction.get("id")
+                if aid:
+                    _ATTRACTION_ID_CACHE[key] = aid
+                    return aid
+        _ATTRACTION_ID_CACHE[key] = None
+        return None
+    except requests.RequestException as e:
+        print(f"[ticketmaster] attractions error for {name!r}: {e}")
+        _ATTRACTION_ID_CACHE[key] = None
+        return None
+
+
 def scrape_ticketmaster(
     latitude: float,
     longitude: float,
@@ -49,8 +114,15 @@ def scrape_ticketmaster(
     size: int = 50,
     classification: Optional[str] = None,
     keyword: Optional[str] = None,
+    attraction_id: Optional[str] = None,
 ) -> list[ScrapedEvent]:
-    """Fetch upcoming events from the Ticketmaster Discovery API."""
+    """Fetch upcoming events from the Ticketmaster Discovery API.
+
+    `attraction_id` lets callers query a specific artist/performer (resolved via
+    `resolve_attraction_id`) which has dramatically better recall than a
+    free-text keyword search — TM's keyword matcher misses common variations
+    like "Beyoncé" vs "Beyonce" and "AC/DC" vs "ACDC".
+    """
     api_key = os.getenv("TICKETMASTER_API_KEY", "")
     if not api_key:
         print("[ticketmaster] No API key configured, skipping")
@@ -73,7 +145,9 @@ def scrape_ticketmaster(
     }
     if classification:
         params["classificationName"] = classification
-    if keyword and keyword.strip():
+    if attraction_id:
+        params["attractionId"] = attraction_id
+    elif keyword and keyword.strip():
         params["keyword"] = keyword.strip()
 
     try:

@@ -131,6 +131,8 @@ def write_curated_events(
     email: str,
     grouped_events: dict[str, list[dict]],
     run_id: str,
+    *,
+    artist_picks: list[dict] | None = None,
 ) -> None:
     """
     Write curated events to the user_curated_events collection in Firebase.
@@ -149,8 +151,12 @@ def write_curated_events(
         "outdoors": [ ... ],
         "other": [ ... ]
       },
-      "total_events": 42
+      "total_events": 42,
+      "artist_picks": [ { ...event..., "matched_artist": "Taylor Swift" }, ... ]
     }
+
+    `artist_picks` powers the home screen's "Artists You Love" carousel and is
+    a flat, pre-sorted list (highest relevance first).
     """
     db = _get_db()
     total = sum(len(v) for v in grouped_events.values())
@@ -162,15 +168,27 @@ def write_curated_events(
         "run_id": run_id,
         "events_by_category": grouped_events,
         "total_events": total,
+        "artist_picks": artist_picks or [],
     })
 
     # Store each parsed event in the catalog table for lookup by id
     all_events: list[dict] = []
     for event_list in grouped_events.values():
         all_events.extend(event_list)
+    if artist_picks:
+        all_events.extend(artist_picks)
     write_parsed_events_to_catalog(all_events)
 
     print(f"  [firebase] Wrote {total} curated events for {email}")
+
+    # Re-emit the precomputed home payload so the client's Firestore stream
+    # sees the new curated events without an extra HTTP round trip.
+    try:
+        from service.home_payload import write_home_payload_safe
+
+        write_home_payload_safe(email)
+    except Exception as e:
+        print(f"  [firebase] home_payload refresh failed for {email}: {e}")
 
 
 def update_user_location(email: str, latitude: float, longitude: float) -> None:
@@ -201,12 +219,94 @@ def clear_user_curated_events() -> int:
     return deleted
 
 
+def _active_user_locations(radius_miles: float) -> list[tuple[float, float]]:
+    """
+    Return (lat, lon) for every user_preferences doc that has a stored
+    location. Used by `purge_catalog_outside_user_radius` to know which
+    catalog entries are still relevant to *some* current user.
+    """
+    db = _get_db()
+    locs: list[tuple[float, float]] = []
+    for doc in db.collection("user_preferences").stream():
+        data = doc.to_dict() or {}
+        lat = data.get("last_latitude")
+        lon = data.get("last_longitude")
+        if lat is None or lon is None:
+            continue
+        try:
+            locs.append((float(lat), float(lon)))
+        except (TypeError, ValueError):
+            continue
+    return locs
+
+
+def purge_catalog_outside_user_radius(
+    radius_miles: float = 50.0,
+) -> dict:
+    """
+    Drop parsed_events_catalog entries that aren't within `radius_miles` of
+    *any* current user's stored location.
+
+    Catalog docs missing lat/lon are kept (we cannot prove they're far away);
+    they are filtered out at render time by the per-user location guard. If
+    no users have a stored location, this is a no-op so we don't wipe data.
+    """
+    from service.home_payload import _haversine_miles  # local import keeps deps light
+
+    db = _get_db()
+    coll = db.collection(PARSED_EVENTS_CATALOG_COLLECTION)
+
+    user_locs = _active_user_locations(radius_miles)
+    if not user_locs:
+        print("  [firebase] catalog purge: no users with location, skipping")
+        return {"kept": 0, "deleted_far": 0, "kept_no_coord": 0}
+
+    deleted_far = 0
+    kept = 0
+    kept_no_coord = 0
+    for doc in coll.stream():
+        data = doc.to_dict() or {}
+        lat_raw = data.get("latitude")
+        lon_raw = data.get("longitude")
+        if lat_raw is None or lon_raw is None:
+            kept_no_coord += 1
+            continue
+        try:
+            ev_lat = float(lat_raw)
+            ev_lon = float(lon_raw)
+        except (TypeError, ValueError):
+            kept_no_coord += 1
+            continue
+        in_range = any(
+            _haversine_miles(ulat, ulon, ev_lat, ev_lon) <= radius_miles
+            for ulat, ulon in user_locs
+        )
+        if in_range:
+            kept += 1
+        else:
+            doc.reference.delete()
+            deleted_far += 1
+
+    print(
+        f"  [firebase] catalog purge: kept {kept}, removed {deleted_far} "
+        f"out-of-range, kept {kept_no_coord} without coords"
+    )
+    return {
+        "kept": kept,
+        "deleted_far": deleted_far,
+        "kept_no_coord": kept_no_coord,
+    }
+
+
 def _doc_is_stale_event(event: dict) -> tuple[bool, str]:
     """
-    Return (True, reason) if the catalog entry should be purged. Items are
-    considered stale when:
-      - they are an event whose date is in the past, OR
-      - they have no usable http(s) image_url (applies to events AND restaurants)
+    Cheap (offline) staleness check. Returns (True, reason) when the catalog
+    entry should be purged for one of:
+      - "past": event date is in the past
+      - "no_image": missing or non-http(s) image_url
+
+    A second pass (`_doc_image_is_unreachable`) probes the network and is run
+    only on docs that pass this cheap check.
     """
     from datetime import datetime as _dt, timezone as _tz
 
@@ -253,17 +353,32 @@ def _doc_is_stale_event(event: dict) -> tuple[bool, str]:
     return False, ""
 
 
-def purge_stale_parsed_events() -> dict:
+def purge_stale_parsed_events(
+    *,
+    probe_network: bool = True,
+    max_workers: int = 16,
+) -> dict:
     """
-    Remove entries from parsed_events_catalog whose event date is in the past
-    or whose event has no `image_url`. Safe to run anytime; restaurants (no
-    `date`) are never touched.
+    Remove entries from parsed_events_catalog that are:
+      - past events,
+      - missing a usable http(s) image_url, or
+      - (if probe_network) point at an image_url that no longer responds 2xx.
+
+    The network probe is what kills lingering Partiful 403 URLs that look
+    valid but can't actually be loaded by the client.
     """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    # Lazy import to avoid a circular dep with pipeline.py.
+    from .pipeline import _url_is_reachable  # type: ignore
+
     db = _get_db()
     coll = db.collection(PARSED_EVENTS_CATALOG_COLLECTION)
+
     deleted_past = 0
     deleted_no_image = 0
-    kept = 0
+    deleted_unreachable = 0
+    survivors: list[tuple] = []  # (doc_ref, image_url)
+
     for doc in coll.stream():
         data = doc.to_dict() or {}
         is_stale, reason = _doc_is_stale_event(data)
@@ -273,14 +388,39 @@ def purge_stale_parsed_events() -> dict:
                 deleted_past += 1
             elif reason == "no_image":
                 deleted_no_image += 1
-        else:
-            kept += 1
+            continue
+        survivors.append((doc.reference, (data.get("image_url") or "").strip()))
+
+    if probe_network and survivors:
+        kept = 0
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {
+                pool.submit(_url_is_reachable, url): (ref, url)
+                for ref, url in survivors
+                if url
+            }
+            for fut in as_completed(futures):
+                ref, _url = futures[fut]
+                try:
+                    ok = fut.result()
+                except Exception:
+                    ok = False
+                if ok:
+                    kept += 1
+                else:
+                    ref.delete()
+                    deleted_unreachable += 1
+    else:
+        kept = len(survivors)
+
     print(
         f"  [firebase] parsed_events_catalog purge: "
-        f"kept {kept}, removed {deleted_past} past, {deleted_no_image} imageless"
+        f"kept {kept}, removed {deleted_past} past, "
+        f"{deleted_no_image} imageless, {deleted_unreachable} unreachable"
     )
     return {
         "kept": kept,
         "deleted_past": deleted_past,
         "deleted_no_image": deleted_no_image,
+        "deleted_unreachable": deleted_unreachable,
     }

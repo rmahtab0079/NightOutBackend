@@ -67,20 +67,48 @@ def main() -> None:
         action="store_true",
         help="Do not purge past/imageless entries from parsed_events_catalog.",
     )
+    parser.add_argument(
+        "--skip-image-probe",
+        action="store_true",
+        help=(
+            "Skip the per-URL HTTP reachability probe during the catalog "
+            "purge. The probe is what removes URLs that look valid but 403 "
+            "(e.g. Partiful Firebase Storage links). Skip only if you need a "
+            "fast purge."
+        ),
+    )
     args = parser.parse_args()
 
     from service.events_parser.firebase_writer import (
         clear_user_curated_events,
+        purge_catalog_outside_user_radius,
         purge_stale_parsed_events,
     )
 
     if not args.skip_catalog_purge:
-        print("Purging parsed_events_catalog (past + imageless events)...")
-        stats = purge_stale_parsed_events()
+        probe = not args.skip_image_probe
+        print(
+            "Purging parsed_events_catalog (past + imageless"
+            + (" + unreachable" if probe else "")
+            + " events)..."
+        )
+        stats = purge_stale_parsed_events(probe_network=probe)
         print(
             f"Catalog purge: kept={stats['kept']}, "
             f"past_removed={stats['deleted_past']}, "
-            f"imageless_removed={stats['deleted_no_image']}."
+            f"imageless_removed={stats['deleted_no_image']}, "
+            f"unreachable_removed={stats.get('deleted_unreachable', 0)}."
+        )
+
+        print(
+            f"\nPurging parsed_events_catalog entries not within "
+            f"{args.radius:.0f}mi of any active user..."
+        )
+        loc_stats = purge_catalog_outside_user_radius(radius_miles=args.radius)
+        print(
+            f"Location purge: kept={loc_stats['kept']}, "
+            f"out_of_range_removed={loc_stats['deleted_far']}, "
+            f"kept_no_coord={loc_stats['kept_no_coord']}."
         )
     else:
         print("Skipping parsed_events_catalog purge (--skip-catalog-purge).")

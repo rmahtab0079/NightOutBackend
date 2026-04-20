@@ -6,7 +6,7 @@ import random
 import threading
 import time
 from pydantic import BaseModel
-from typing import Optional, List, Set
+from typing import Any, Dict, Optional, List, Set
 from dotenv import load_dotenv
 import requests
 import json
@@ -149,6 +149,18 @@ class UpdatePreferenceRequest(BaseModel):
     itemId: int  # ID to add
 
 
+class PatchUserPreferencesRequest(BaseModel):
+    """Partial update for `user_preferences/{email}`.
+
+    The client sends only the fields it wants to change (one section at a
+    time, e.g. `{"favoriteArtists": [...]}`). The endpoint validates each
+    field name against an allow-list and merges them into Firestore so other
+    fields stay untouched.
+    """
+
+    fields: Dict[str, Any]
+
+
 class AddAssetRequest(BaseModel):
     asset_type: str  # 'movie' or 'tv'
     asset_id: int  # ID of the movie or TV show
@@ -181,6 +193,28 @@ class PlaceSwipe(BaseModel):
 
 class PlaceSwipeBatch(BaseModel):
     swipes: List[PlaceSwipe]
+
+
+class SaveItemRequest(BaseModel):
+    """Save / unsave a single discoverable item for later.
+
+    `kind` is one of: 'movie', 'tv', 'event'. `item_id` is whatever id the
+    client has on hand (TMDB id for movies/tv, internal event_id for curated
+    events). It's coerced to a string before being used in the Firestore
+    document key so int/str ids hash to the same bucket.
+
+    `snapshot` is an optional shallow copy of the card's display fields so the
+    Saved tab can render the item even if the source list later disappears.
+    """
+
+    kind: str
+    item_id: str
+    snapshot: Optional[dict] = None
+
+
+class UnsaveItemRequest(BaseModel):
+    kind: str
+    item_id: str
 
 
 class RecomputeGenreRecsRequest(BaseModel):
@@ -274,6 +308,71 @@ def _verify_admin_token(admin_token: Optional[str]) -> None:
         raise HTTPException(status_code=403, detail="Invalid admin token")
 
 
+# Names sent by the Flutter onboarding flow are normalized using the same
+# mapping the watch_providers job uses, so equality on these strings always
+# lines up with what TMDB returns.
+_USER_SERVICE_ALIASES = {
+    "amazon prime video": "amazon prime video",
+    "amazon video": "amazon prime video",
+    "prime video": "amazon prime video",
+    "amazon": "amazon prime video",
+    "disney plus": "disney+",
+    "disney+": "disney+",
+    "max": "hbo max",
+    "hbo": "hbo max",
+    "hbo max": "hbo max",
+    "apple tv plus": "apple tv+",
+    "apple tv+": "apple tv+",
+    "apple tv": "apple tv+",
+    "paramount plus": "paramount+",
+    "paramount+": "paramount+",
+    "peacock premium": "peacock",
+    "peacock": "peacock",
+    "youtube": "youtube premium",
+    "youtube premium": "youtube premium",
+    "tubi tv": "tubi",
+    "tubi": "tubi",
+    "fandango at home": "vudu",
+    "vudu": "vudu",
+    "amc plus": "amc+",
+    "amc+": "amc+",
+    "discovery plus": "discovery+",
+    "discovery+": "discovery+",
+    "espn plus": "espn+",
+    "espn+": "espn+",
+    "fubo": "fubo",
+    "fubotv": "fubo",
+    "fubo tv": "fubo",
+    "fubo sports": "fubo",
+    "fubo sports network": "fubo",
+}
+
+
+def _normalize_service_name(name: str) -> str:
+    key = (name or "").strip().lower()
+    return _USER_SERVICE_ALIASES.get(key, key)
+
+
+def _detail_matches_user_services(detail: dict, user_services: Set[str]) -> bool:
+    """Return True if the asset has at least one flatrate/free provider that
+    overlaps with the user's selected streaming services. Treats missing
+    provider data as a non-match so we don't surface titles we can't verify."""
+    if not user_services:
+        return True
+    providers = (detail or {}).get("watch_providers") or []
+    for p in providers:
+        if not isinstance(p, dict):
+            continue
+        if p.get("provider_type") not in ("flatrate", "free"):
+            continue
+        candidate = _normalize_service_name(
+            p.get("provider_name") or p.get("original_name") or ""
+        )
+        if candidate and candidate in user_services:
+            return True
+    return False
+
+
 def _get_precomputed_genre_ids(
     email: str,
     asset_type: str,
@@ -324,6 +423,12 @@ async def say_hello(name: str):
 class NightInSuggestionRequest(BaseModel):
     party_size: int
     genres: List[int] = []
+    # When true, the backend filters candidates so the picked title is
+    # available on at least one of `services`. Falls back to a normal pick
+    # if nothing in the candidate pool matches, so the user always gets a
+    # suggestion. Empty `services` makes the flag a no-op.
+    only_my_services: bool = False
+    services: List[str] = []
 
 
 class NightOutSuggestionRequest(BaseModel):
@@ -789,26 +894,129 @@ async def get_night_in_suggestion(req: NightInSuggestionRequest):
     from datetime import date
     current_year = date.today().year
 
-    asset_type = random.choice(["movie", "tv"])
-    if asset_type == "movie":
-        data = get_movies(start_year=2000, end_year=current_year, genres=req.genres)
-    else:
-        data = get_tv(start_year=2000, end_year=current_year, genres=req.genres)
+    # Try a sequence of progressively-looser fetches so the user always gets
+    # *something* instead of a "No matches" wall:
+    #   1. requested genres on the chosen asset type
+    #   2. requested genres on the *other* asset type
+    #   3. no genre filter on the chosen asset type
+    #   4. no genre filter on the other asset type
+    primary = random.choice(["movie", "tv"])
+    other = "tv" if primary == "movie" else "movie"
 
-    results = data.get("results", [])
-    if not results:
-        raise HTTPException(status_code=404, detail="No suggestions found")
+    def _fetch(asset_type: str, genres):
+        if asset_type == "movie":
+            return get_movies(
+                start_year=2000, end_year=current_year, genres=genres or []
+            )
+        return get_tv(
+            start_year=2000, end_year=current_year, genres=genres or []
+        )
 
-    pick = random.choice(results)
-    pick["asset_type"] = asset_type
+    attempts = [
+        (primary, req.genres),
+        (other, req.genres),
+        (primary, []),
+        (other, []),
+    ]
 
+    # Normalize the user's onboarding-style service names into the same
+    # canonical form provider data uses, so equality comparisons line up.
+    user_services_set: set = set()
+    if req.only_my_services and req.services:
+        user_services_set = {_normalize_service_name(s) for s in req.services if s}
+
+    pick = None
+    pick_providers: List[dict] = []
+    asset_type = primary
+    services_filter_applied = False
+    services_filter_failed = False
+
+    # Lazy import — avoids a circular when the watch_providers job is unused.
     try:
         from service.watch_providers_job import get_providers_for_asset
-        providers = get_providers_for_asset(pick["id"], asset_type, read_from_local=False)
-        pick["watch_providers"] = providers
-    except Exception as e:
-        print(f"Could not fetch watch providers: {e}")
-        pick["watch_providers"] = []
+    except Exception:
+        get_providers_for_asset = None  # type: ignore
+
+    def _candidate_providers(candidate_id: int, atype: str) -> List[dict]:
+        """Fetch providers for a candidate. Returns [] on any failure so the
+        outer logic can treat the candidate as "not on user's services"
+        without blowing up the request."""
+        if get_providers_for_asset is None:
+            return []
+        try:
+            return get_providers_for_asset(
+                candidate_id, atype, read_from_local=False
+            ) or []
+        except Exception as exc:
+            print(
+                f"Could not fetch watch providers for {atype} {candidate_id}: {exc}"
+            )
+            return []
+
+    for attempt_type, attempt_genres in attempts:
+        data = _fetch(attempt_type, attempt_genres)
+        results = data.get("results", [])
+        if not results:
+            continue
+
+        if user_services_set:
+            # Sample at most N candidates per attempt so we don't fan out to
+            # hundreds of provider lookups. 25 is enough to find a match for
+            # popular genres while keeping latency bounded.
+            shuffled = random.sample(results, min(len(results), 25))
+            for candidate in shuffled:
+                providers = _candidate_providers(candidate["id"], attempt_type)
+                if _detail_matches_user_services(
+                    {"watch_providers": providers}, user_services_set
+                ):
+                    pick = candidate
+                    pick_providers = providers
+                    asset_type = attempt_type
+                    services_filter_applied = True
+                    if attempt_genres != req.genres:
+                        pick["genre_fallback"] = True
+                    break
+            if pick is not None:
+                break
+        else:
+            pick = random.choice(results)
+            asset_type = attempt_type
+            if attempt_genres != req.genres:
+                pick["genre_fallback"] = True
+            break
+
+    # If the user asked for service-only and nothing matched anywhere, fall
+    # back to a normal random pick so the screen never errors out, and tell
+    # the client we couldn't honor the filter.
+    if pick is None and user_services_set:
+        services_filter_failed = True
+        for attempt_type, attempt_genres in attempts:
+            data = _fetch(attempt_type, attempt_genres)
+            results = data.get("results", [])
+            if results:
+                pick = random.choice(results)
+                asset_type = attempt_type
+                if attempt_genres != req.genres:
+                    pick["genre_fallback"] = True
+                break
+
+    if pick is None:
+        raise HTTPException(status_code=404, detail="No suggestions found")
+
+    pick["asset_type"] = asset_type
+    pick["services_filter_applied"] = services_filter_applied
+    pick["services_filter_failed"] = services_filter_failed
+
+    if pick_providers:
+        # Reuse the providers we already fetched while searching for a match.
+        pick["watch_providers"] = pick_providers
+    else:
+        try:
+            providers = _candidate_providers(pick["id"], asset_type)
+            pick["watch_providers"] = providers
+        except Exception as e:
+            print(f"Could not fetch watch providers: {e}")
+            pick["watch_providers"] = []
 
     try:
         youtube_key = _get_tmdb_youtube_trailer(pick["id"], asset_type)
@@ -1059,6 +1267,212 @@ async def update_user_preferences(payload: UpdatePreferenceRequest, authorizatio
         raise
     except Exception as e:
         print(e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# Allow-list of fields the section editors are permitted to overwrite via the
+# /user_preferences/patch endpoint, paired with their expected Python type.
+# Anything not listed here is rejected so a malicious or buggy client can't
+# clobber server-managed fields like `last_latitude`, `createdAt`, swipe
+# history, etc. Lists of strings/ints are checked element-by-element below.
+_PATCHABLE_PREFERENCE_FIELDS: Dict[str, type] = {
+    "age": int,
+    "movieIds": list,
+    "tvShowIds": list,
+    "streamingServices": list,
+    "dietaryPreferences": list,
+    "cuisines": list,
+    "interests": list,
+    "favoriteTeams": list,
+    "favoriteArtists": list,
+}
+
+# Subset of the patchable fields that change which events / restaurants /
+# titles a user should see. When any of these is updated, kick off a per-user
+# pipeline rerun + home payload rebuild in the background so the client sees
+# the new picks without waiting for the next hourly cron.
+_EVENT_AFFECTING_PREFERENCE_FIELDS: Set[str] = {
+    "favoriteArtists",
+    "favoriteTeams",
+    "streamingServices",
+    "cuisines",
+    "dietaryPreferences",
+    "interests",
+    "age",
+}
+
+# Per-user cooldown so a user mashing the same edit button doesn't spawn a
+# rescrape thread per tap. Lives next to the location-driven cooldown.
+_PATCH_RESCRAPE_COOLDOWN_SECONDS = 60
+_patch_rescrape_lock = threading.Lock()
+_patch_rescrape_last_run: Dict[str, float] = {}
+
+
+def _validate_patch_value(field: str, value: Any) -> Any:
+    """Coerce / validate a single field from the patch payload.
+
+    Returns the cleaned value to write to Firestore, or raises HTTPException
+    with a 400 status when the value doesn't match the schema for `field`.
+    """
+    expected = _PATCHABLE_PREFERENCE_FIELDS[field]
+
+    # `age` is the only scalar; everything else is a list of strings or ints.
+    if field == "age":
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Field '{field}' must be an integer or null",
+            )
+        if value < 13 or value > 120:
+            raise HTTPException(
+                status_code=400,
+                detail="Age must be between 13 and 120",
+            )
+        return int(value)
+
+    if expected is list:
+        if not isinstance(value, list):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Field '{field}' must be a list",
+            )
+        if field in {"movieIds", "tvShowIds"}:
+            cleaned: List[int] = []
+            for item in value:
+                if isinstance(item, bool) or not isinstance(item, int):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"All items in '{field}' must be integers",
+                    )
+                cleaned.append(int(item))
+            return cleaned
+        cleaned_str: List[str] = []
+        for item in value:
+            if not isinstance(item, str):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"All items in '{field}' must be strings",
+                )
+            stripped = item.strip()
+            if stripped:
+                cleaned_str.append(stripped)
+        return cleaned_str
+
+    raise HTTPException(status_code=400, detail=f"Unknown field '{field}'")
+
+
+def _refresh_home_payload_safe(email: str) -> None:
+    """Background-thread entrypoint that rebuilds and writes the user's home
+    payload, swallowing any failures so the request handler never sees them.
+    """
+    try:
+        from service.home_payload import write_home_payload_safe
+
+        write_home_payload_safe(email)
+    except Exception as e:
+        print(f"[patch_prefs] home_payload refresh failed for {email}: {e}")
+
+
+@app.post("/user_preferences/patch")
+async def patch_user_preferences(
+    payload: PatchUserPreferencesRequest,
+    authorization: Optional[str] = Header(default=None),
+):
+    """Partial update for the signed-in user's preference document.
+
+    Replaces only the fields included in `payload.fields`, leaving everything
+    else (location, swipe history, watched lists, ...) untouched. Used by the
+    Preferences screen's per-section editors so users can tweak a single
+    interest/artist/etc. without re-running onboarding.
+
+    When an event-affecting field (artists, teams, cuisines, ...) is changed,
+    schedules a per-user pipeline rerun + home payload rebuild in the
+    background so the home screen reflects the new picks shortly after.
+    """
+    initialize_firebase_if_needed()
+    if firebase_db is None:
+        raise HTTPException(
+            status_code=501,
+            detail=(
+                "Firebase not configured. Set FIREBASE_SERVICE_ACCOUNT_PATH and "
+                "FIREBASE_PROJECT_ID environment variables to enable writes."
+            ),
+        )
+
+    decoded = _verify_and_get_user(authorization)
+    email = decoded.get("email")
+    if not email:
+        raise HTTPException(status_code=400, detail="Email not found in token")
+
+    if not payload.fields:
+        raise HTTPException(status_code=400, detail="No fields provided")
+
+    unknown = [f for f in payload.fields.keys() if f not in _PATCHABLE_PREFERENCE_FIELDS]
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Field(s) not allowed: {', '.join(sorted(unknown))}",
+        )
+
+    cleaned: Dict[str, Any] = {
+        field: _validate_patch_value(field, value)
+        for field, value in payload.fields.items()
+    }
+
+    try:
+        prefs_ref = firebase_db.collection("user_preferences").document(email)
+        snapshot = prefs_ref.get()
+        if not snapshot.exists:
+            # New users hit /user_preferences (full submit) at the end of
+            # onboarding; the patch endpoint is for tweaking an existing doc.
+            raise HTTPException(
+                status_code=404,
+                detail="User preferences not found. Complete onboarding first.",
+            )
+
+        cleaned["updatedAt"] = datetime.utcnow().isoformat() + "Z"
+        prefs_ref.set(cleaned, merge=True)
+
+        affected = [f for f in cleaned.keys() if f in _EVENT_AFFECTING_PREFERENCE_FIELDS]
+        rescrape_started = False
+        if affected:
+            with _patch_rescrape_lock:
+                last = _patch_rescrape_last_run.get(email)
+                now_ts = time.time()
+                if last is None or (now_ts - last) >= _PATCH_RESCRAPE_COOLDOWN_SECONDS:
+                    _patch_rescrape_last_run[email] = now_ts
+                    rescrape_started = True
+
+            if rescrape_started:
+                print(
+                    f"[patch_prefs] {email} updated {affected} -- "
+                    "starting per-user pipeline + home payload refresh"
+                )
+                threading.Thread(
+                    target=_per_user_pipeline_safe,
+                    args=(email,),
+                    daemon=True,
+                ).start()
+            # Always rebuild the home payload (lightweight) so even when the
+            # rescrape is skipped by cooldown, the new prefs are reflected in
+            # what the home screen pulls back from Firestore.
+            threading.Thread(
+                target=_refresh_home_payload_safe,
+                args=(email,),
+                daemon=True,
+            ).start()
+
+        return {
+            "message": "Preferences updated",
+            "updated_fields": sorted(cleaned.keys() - {"updatedAt"}),
+            "rescrape_started": rescrape_started,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"patch_user_preferences error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1359,6 +1773,199 @@ async def get_user_place_history(authorization: Optional[str] = Header(default=N
         return {
             "seen_place_names": liked + disliked,
             "liked_place_names": liked,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# -----------------------------------------------------------------------------
+# Saved-for-later items
+#
+# Lightweight "bookmark" feature: any movie / TV show / curated event card on
+# the discover surface (and on the matching detail screens) exposes a save
+# action that writes a single doc into
+#   user_saved_items/{email}/items/{kind}_{item_id}
+# We store a `snapshot` so the Saved tab can render the card without re-
+# resolving the source list (which may have rotated or been filtered out).
+# Reads/writes are scoped to the authenticated caller's email so users can
+# only see and mutate their own saved list.
+# -----------------------------------------------------------------------------
+
+_ALLOWED_SAVE_KINDS = {"movie", "tv", "event"}
+
+
+def _save_doc_id(kind: str, item_id: str) -> str:
+    """Stable Firestore doc id for a (kind, id) pair. Normalising both sides
+    means saving from a card with `id: 550` (int) and unsaving from a card
+    with `id: "550"` (string) hit the same document."""
+    safe_id = str(item_id).strip()
+    return f"{kind}_{safe_id}"
+
+
+@app.post("/saved_items/save")
+async def save_item_for_later(
+    payload: SaveItemRequest,
+    authorization: Optional[str] = Header(default=None),
+):
+    initialize_firebase_if_needed()
+    if firebase_db is None:
+        raise HTTPException(status_code=501, detail="Firebase not configured")
+
+    decoded = _verify_and_get_user(authorization)
+    email = decoded.get("email")
+    if not email:
+        raise HTTPException(status_code=400, detail="Email not found in token")
+
+    kind = (payload.kind or "").strip().lower()
+    if kind not in _ALLOWED_SAVE_KINDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid kind '{payload.kind}'. Use one of {sorted(_ALLOWED_SAVE_KINDS)}.",
+        )
+
+    item_id = (payload.item_id or "").strip()
+    if not item_id:
+        raise HTTPException(status_code=400, detail="item_id is required")
+
+    try:
+        doc_ref = (
+            firebase_db.collection("user_saved_items")
+            .document(email)
+            .collection("items")
+            .document(_save_doc_id(kind, item_id))
+        )
+        doc_ref.set(
+            {
+                "kind": kind,
+                "item_id": item_id,
+                "snapshot": payload.snapshot or {},
+                "saved_at": firestore.SERVER_TIMESTAMP,
+            },
+            merge=True,
+        )
+        return {"message": "saved", "kind": kind, "item_id": item_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/saved_items/unsave")
+async def unsave_item_for_later(
+    payload: UnsaveItemRequest,
+    authorization: Optional[str] = Header(default=None),
+):
+    initialize_firebase_if_needed()
+    if firebase_db is None:
+        raise HTTPException(status_code=501, detail="Firebase not configured")
+
+    decoded = _verify_and_get_user(authorization)
+    email = decoded.get("email")
+    if not email:
+        raise HTTPException(status_code=400, detail="Email not found in token")
+
+    kind = (payload.kind or "").strip().lower()
+    if kind not in _ALLOWED_SAVE_KINDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid kind '{payload.kind}'. Use one of {sorted(_ALLOWED_SAVE_KINDS)}.",
+        )
+
+    item_id = (payload.item_id or "").strip()
+    if not item_id:
+        raise HTTPException(status_code=400, detail="item_id is required")
+
+    try:
+        doc_ref = (
+            firebase_db.collection("user_saved_items")
+            .document(email)
+            .collection("items")
+            .document(_save_doc_id(kind, item_id))
+        )
+        doc_ref.delete()
+        return {"message": "unsaved", "kind": kind, "item_id": item_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/saved_items")
+async def list_saved_items(authorization: Optional[str] = Header(default=None)):
+    """Return the authenticated user's saved cards grouped by kind.
+
+    Newest first within each bucket. Documents missing a `saved_at` (e.g.
+    legacy rows written before this endpoint shipped) are pushed to the end
+    rather than dropped so users never lose data silently.
+    """
+
+    initialize_firebase_if_needed()
+    if firebase_db is None:
+        raise HTTPException(status_code=501, detail="Firebase not configured")
+
+    decoded = _verify_and_get_user(authorization)
+    email = decoded.get("email")
+    if not email:
+        raise HTTPException(status_code=400, detail="Email not found in token")
+
+    try:
+        items_ref = (
+            firebase_db.collection("user_saved_items")
+            .document(email)
+            .collection("items")
+        )
+        docs = list(items_ref.stream())
+
+        movies: list[dict] = []
+        tv: list[dict] = []
+        events: list[dict] = []
+
+        for doc in docs:
+            data = doc.to_dict() or {}
+            entry = {
+                "kind": data.get("kind"),
+                "item_id": data.get("item_id"),
+                "snapshot": data.get("snapshot") or {},
+                "saved_at": data.get("saved_at"),
+            }
+            kind = (entry["kind"] or "").lower()
+            if kind == "movie":
+                movies.append(entry)
+            elif kind == "tv":
+                tv.append(entry)
+            elif kind == "event":
+                events.append(entry)
+
+        def _sort_key(entry: dict):
+            ts = entry.get("saved_at")
+            # Firestore timestamps expose `.timestamp()`; fall back to 0 so
+            # legacy rows sort last instead of crashing the comparator.
+            try:
+                return -float(ts.timestamp())  # type: ignore[union-attr]
+            except Exception:
+                return 0.0
+
+        movies.sort(key=_sort_key)
+        tv.sort(key=_sort_key)
+        events.sort(key=_sort_key)
+
+        # Strip the (non-JSON-serializable) Firestore timestamp from the
+        # response. The client already has its own ordering and doesn't need
+        # the raw timestamp field.
+        for bucket in (movies, tv, events):
+            for entry in bucket:
+                entry.pop("saved_at", None)
+
+        return {
+            "movies": movies,
+            "tv": tv,
+            "events": events,
+            "total": len(movies) + len(tv) + len(events),
         }
     except HTTPException:
         raise
@@ -1785,11 +2392,37 @@ async def reshuffle_curated(
         data = doc.to_dict()
         events_by_cat = data.get("events_by_category", {})
 
+        # Anchor the reshuffle pool to the user's region. Without this the
+        # novelty injection silently mixes in events from other cities.
+        from service.home_payload import (
+            DEFAULT_USER_RADIUS_MILES,
+            event_is_within_user_radius,
+        )
+
+        user_lat: Optional[float] = None
+        user_lon: Optional[float] = None
+        try:
+            prefs_doc = firebase_db.collection("user_preferences").document(email).get()
+            if prefs_doc.exists:
+                prefs = prefs_doc.to_dict() or {}
+                lat_raw = prefs.get("last_latitude")
+                lon_raw = prefs.get("last_longitude")
+                if lat_raw is not None and lon_raw is not None:
+                    user_lat = float(lat_raw)
+                    user_lon = float(lon_raw)
+        except (TypeError, ValueError):
+            user_lat = None
+            user_lon = None
+
         catalog_docs = firebase_db.collection("parsed_events_catalog").stream()
         catalog_by_cat: dict[str, list[dict]] = {}
         for cdoc in catalog_docs:
             ev = cdoc.to_dict()
             if not _event_passes_filters(ev):
+                continue
+            if not event_is_within_user_radius(
+                ev, user_lat, user_lon, DEFAULT_USER_RADIUS_MILES
+            ):
                 continue
             cat = ev.get("category") or "other"
             if cat == "food" and ev.get("source") != "google_places":
@@ -1835,6 +2468,15 @@ async def reshuffle_curated(
             "last_reshuffled": _dt.utcnow().isoformat() + "Z",
         })
 
+        # Re-emit the home payload so the client's Firestore stream picks up
+        # the reshuffled list without needing to re-fetch over HTTP.
+        try:
+            from service.home_payload import write_home_payload_safe
+
+            write_home_payload_safe(email)
+        except Exception as e:
+            print(f"home_payload refresh failed for {email}: {e}")
+
         return {
             "status": "reshuffled",
             "items_swapped": swapped,
@@ -1873,11 +2515,38 @@ async def featured_picks(
     movie_slots = 1
     tv_slots = 1
 
+    # Resolve the user's stored location so the carousel only surfaces events
+    # near them. Without this, /featured_picks returns a global random sample.
+    from service.home_payload import (
+        DEFAULT_USER_RADIUS_MILES,
+        event_is_within_user_radius,
+    )
+
+    user_lat: Optional[float] = None
+    user_lon: Optional[float] = None
+    if email:
+        try:
+            prefs_doc = firebase_db.collection("user_preferences").document(email).get()
+            if prefs_doc.exists:
+                prefs = prefs_doc.to_dict() or {}
+                lat_raw = prefs.get("last_latitude")
+                lon_raw = prefs.get("last_longitude")
+                if lat_raw is not None and lon_raw is not None:
+                    user_lat = float(lat_raw)
+                    user_lon = float(lon_raw)
+        except (TypeError, ValueError):
+            user_lat = None
+            user_lon = None
+
     # --- Events from parsed_events_catalog ---
     catalog_by_cat: dict[str, list[dict]] = {}
     for cdoc in firebase_db.collection("parsed_events_catalog").stream():
         ev = cdoc.to_dict()
         if not _event_passes_filters(ev):
+            continue
+        if not event_is_within_user_radius(
+            ev, user_lat, user_lon, DEFAULT_USER_RADIUS_MILES
+        ):
             continue
         eid = ev.get("source", "") + ":" + (ev.get("source_id") or ev.get("name", ""))
         if eid in exclude_set:
@@ -1947,9 +2616,98 @@ async def featured_picks(
     return {"featured": featured, "count": len(featured)}
 
 
+@app.get("/home_payload")
+async def get_home_payload(
+    authorization: Optional[str] = Header(default=None),
+    refresh: bool = False,
+):
+    """
+    One-shot fallback for the precomputed home payload.
+
+    Normally the Flutter client subscribes directly to Firestore at
+    `user_home_payload/{email}` for live updates. This endpoint is used:
+      * on first-ever signup, before any cron run has produced a doc, or
+      * by clients that can't talk to Firestore directly, or
+      * when `refresh=true` is passed to force a rebuild on demand.
+    """
+    initialize_firebase_if_needed()
+    if firebase_db is None:
+        raise HTTPException(status_code=501, detail="Firebase not configured")
+
+    decoded = _verify_and_get_user(authorization)
+    email = decoded.get("email")
+    if not email:
+        raise HTTPException(status_code=400, detail="Email not found in token")
+
+    from service.home_payload import (
+        HOME_PAYLOAD_COLLECTION,
+        build_home_payload,
+        write_home_payload,
+    )
+
+    if refresh:
+        payload = write_home_payload(email)
+        if payload is None:
+            raise HTTPException(status_code=500, detail="Failed to build home payload")
+        return payload
+
+    doc = firebase_db.collection(HOME_PAYLOAD_COLLECTION).document(email).get()
+    if doc.exists:
+        return doc.to_dict()
+
+    # No cached payload yet (e.g. brand-new signup). Build it on demand and
+    # persist so subsequent stream subscribers see the same data.
+    payload = write_home_payload(email)
+    if payload is None:
+        raise HTTPException(status_code=500, detail="Failed to build home payload")
+    return payload
+
+
 class UpdateLocationRequest(BaseModel):
     latitude: float
     longitude: float
+
+
+# Per-user cooldown (seconds) for location-driven re-scrapes. Without this a
+# noisy location stream from the client could trigger a fresh per-user pipeline
+# every few seconds while the user is in transit.
+_LOCATION_RESCRAPE_COOLDOWN_SECONDS = 5 * 60
+# Distance (miles) the user has to move before we treat the location update as
+# meaningful enough to re-scrape. Anything smaller is just GPS jitter.
+_LOCATION_RESCRAPE_THRESHOLD_MILES = 10.0
+_location_rescrape_last_run: dict[str, float] = {}
+_location_rescrape_lock = threading.Lock()
+
+
+def _haversine_miles_simple(
+    lat1: float, lon1: float, lat2: float, lon2: float
+) -> float:
+    import math
+
+    R = 3958.8
+    d_lat = math.radians(lat2 - lat1)
+    d_lon = math.radians(lon2 - lon1)
+    a = (
+        math.sin(d_lat / 2) ** 2
+        + math.cos(math.radians(lat1))
+        * math.cos(math.radians(lat2))
+        * math.sin(d_lon / 2) ** 2
+    )
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def _per_user_pipeline_safe(email: str) -> None:
+    """
+    Background entrypoint for the location-driven per-user re-scrape. Always
+    swallows exceptions so a failure here can never bring down the request
+    handler that scheduled it.
+    """
+    try:
+        from service.events_parser.pipeline import run_pipeline_for_user
+
+        run_pipeline_for_user(email)
+    except Exception as e:
+        print(f"[per_user_pipeline] {email} failed: {e}")
 
 
 @app.post("/user_preferences/location")
@@ -1957,7 +2715,13 @@ async def update_user_location(
     req: UpdateLocationRequest,
     authorization: Optional[str] = Header(default=None),
 ):
-    """Store the user's last known location for background event curation."""
+    """Store the user's last known location for background event curation.
+
+    If the location moved by more than `_LOCATION_RESCRAPE_THRESHOLD_MILES`
+    since the last stored position (or there was no prior position), kicks off
+    a per-user pipeline rerun in a background thread so the home payload
+    reflects the new region without waiting for the next hourly cron.
+    """
     initialize_firebase_if_needed()
     if firebase_db is None:
         raise HTTPException(status_code=501, detail="Firebase not configured")
@@ -1968,12 +2732,61 @@ async def update_user_location(
         raise HTTPException(status_code=400, detail="Email not found in token")
 
     try:
-        firebase_db.collection("user_preferences").document(email).update({
+        prefs_ref = firebase_db.collection("user_preferences").document(email)
+
+        prev_snapshot = prefs_ref.get()
+        prev = prev_snapshot.to_dict() or {} if prev_snapshot.exists else {}
+        prev_lat = prev.get("last_latitude")
+        prev_lon = prev.get("last_longitude")
+
+        prefs_ref.update({
             "last_latitude": req.latitude,
             "last_longitude": req.longitude,
             "location_updated_at": datetime.utcnow().isoformat() + "Z",
         })
-        return {"message": "Location updated"}
+
+        moved_miles: Optional[float] = None
+        try:
+            if prev_lat is not None and prev_lon is not None:
+                moved_miles = _haversine_miles_simple(
+                    float(prev_lat), float(prev_lon),
+                    req.latitude, req.longitude,
+                )
+        except (TypeError, ValueError):
+            moved_miles = None
+
+        meaningful_move = (
+            prev_lat is None
+            or prev_lon is None
+            or (moved_miles is not None and moved_miles >= _LOCATION_RESCRAPE_THRESHOLD_MILES)
+        )
+
+        rescrape_started = False
+        if meaningful_move:
+            with _location_rescrape_lock:
+                last = _location_rescrape_last_run.get(email)
+                now_ts = time.time()
+                if last is None or (now_ts - last) >= _LOCATION_RESCRAPE_COOLDOWN_SECONDS:
+                    _location_rescrape_last_run[email] = now_ts
+                    rescrape_started = True
+
+            if rescrape_started:
+                print(
+                    f"[location] {email} moved "
+                    f"{'(no prior coords)' if moved_miles is None else f'{moved_miles:.1f}mi'} "
+                    "-- starting per-user pipeline"
+                )
+                threading.Thread(
+                    target=_per_user_pipeline_safe,
+                    args=(email,),
+                    daemon=True,
+                ).start()
+
+        return {
+            "message": "Location updated",
+            "moved_miles": moved_miles,
+            "rescrape_started": rescrape_started,
+        }
     except HTTPException:
         raise
     except Exception as e:
@@ -2628,6 +3441,47 @@ async def fcm_token_count(
     return {"users": total_users, "tokens": total_tokens}
 
 
+@app.get("/admin/list_fcm_tokens")
+async def list_fcm_tokens(
+    x_admin_token: Optional[str] = Header(default=None),
+):
+    """List every user that has at least one FCM token registered.
+
+    Returns UID, email, display name, and the number of tokens for each.
+    Useful for picking a UID to use with `make broadcast-uid`.
+    """
+    _verify_admin_token(x_admin_token)
+    initialize_firebase_if_needed()
+    if firebase_db is None:
+        raise HTTPException(status_code=501, detail="Firebase not configured")
+
+    users: list[dict] = []
+    for doc in firebase_db.collection(FCM_TOKENS_COLLECTION).stream():
+        tokens = (doc.to_dict() or {}).get("tokens") or []
+        if not tokens:
+            continue
+        uid = doc.id
+        try:
+            user_record = firebase_auth.get_user(uid)
+            email = user_record.email or "(no email)"
+            display_name = user_record.display_name or ""
+        except Exception:
+            email = "(unknown)"
+            display_name = ""
+        users.append({
+            "uid": uid,
+            "email": email,
+            "display_name": display_name,
+            "token_count": len(tokens),
+            "token_previews": [
+                f"{t[:8]}…{t[-8:]}" if len(t) > 20 else t for t in tokens
+            ],
+        })
+
+    users.sort(key=lambda u: u["email"])
+    return {"users": users, "total_users": len(users)}
+
+
 @app.post("/admin/purge_all_fcm_tokens")
 async def purge_all_fcm_tokens(
     x_admin_token: Optional[str] = Header(default=None),
@@ -2721,7 +3575,7 @@ async def broadcast_notification(
                     token=token,
                     android=messaging.AndroidConfig(
                         notification=messaging.AndroidNotification(
-                            channel_id="daily_picks",
+                            channel_id="hourly_picks",
                         ),
                     ),
                     apns=messaging.APNSConfig(
@@ -2864,7 +3718,7 @@ async def broadcast_to_uid(
                 token=token,
                 android=messaging.AndroidConfig(
                     notification=messaging.AndroidNotification(
-                        channel_id="daily_picks",
+                        channel_id="hourly_picks",
                     ),
                 ),
                 apns=messaging.APNSConfig(
@@ -2890,7 +3744,6 @@ async def broadcast_to_uid(
                 "token_preview": token_preview,
                 "status": "sent",
                 "message_id": message_id,
-                "delivered_via": "APNs" if "%" in message_id else "FCM(Android)",
             })
             logger.info(
                 "Targeted send: uid=%s email=%s token=%s message_id=%s",
@@ -3129,7 +3982,8 @@ async def get_recommended_movie_v2(
     end_year: Optional[int] = None,
     top_n: int = 5,
     offset: int = 0,
-    bypass_cache: bool = False
+    bypass_cache: bool = False,
+    only_my_services: bool = False,
 ):
     """
     Get movie recommendations based on user preferences with caching and filtering.
@@ -3150,6 +4004,18 @@ async def get_recommended_movie_v2(
     # Get disliked movie IDs to exclude from recommendations
     disliked_movie_ids = user_preferences.get("dislikedMovieIds", [])
     excluded_ids = set(disliked_movie_ids) if disliked_movie_ids else None
+
+    # When the user has opted into the "only my services" filter, normalize
+    # their selected services into the same lowercase canonical form we use
+    # for provider matching. Empty set short-circuits the filter to no-op.
+    user_services: Set[str] = set()
+    if only_my_services:
+        for svc in user_preferences.get("streamingServices", []) or []:
+            norm = _normalize_service_name(svc)
+            if norm:
+                user_services.add(norm)
+        if not user_services:
+            print("only_my_services=True but user has no streamingServices set; skipping filter")
     
     # Parse genres from comma-separated string (optional; when omitted, no genre filter)
     genre_list = None
@@ -3178,7 +4044,9 @@ async def get_recommended_movie_v2(
         if precomputed_ids:
             results = []
             skipped = 0
+            scanned = 0
             for idx, movie_id in enumerate(precomputed_ids):
+                scanned = idx + 1
                 if excluded_ids and movie_id in excluded_ids:
                     continue
                 detail = get_movie_detail(movie_id, "movie")
@@ -3192,6 +4060,8 @@ async def get_recommended_movie_v2(
                             continue
                     except Exception:
                         pass
+                if user_services and not _detail_matches_user_services(detail, user_services):
+                    continue
                 # Handle offset for pagination
                 if skipped < offset:
                     skipped += 1
@@ -3207,22 +4077,30 @@ async def get_recommended_movie_v2(
                 })
                 if len(results) >= top_n:
                     break
-            return {"results": results, "count": len(results), "offset": offset, "has_more": (skipped + len(results)) < len(precomputed_ids)}
+            return {"results": results, "count": len(results), "offset": offset, "has_more": scanned < len(precomputed_ids)}
 
         # Fallback to dynamic recommendation (requires at least one movie preference)
         if not movie_ids:
             return {"results": [], "count": 0, "offset": offset, "has_more": False}
+        # When filtering by services, request a wider pool so we still have
+        # enough candidates after dropping titles the user can't stream.
+        fetch_size = (top_n + offset) * (4 if user_services else 1)
         results = get_similar_assets(
             asset_ids=set(movie_ids),
             asset_type="movie",
             genres=genre_list,
             start_year=start_year,
             end_year=end_year,
-            top_n=top_n + offset,
+            top_n=max(fetch_size, top_n + offset),
             read_from_local=False,
             bypass_cache=bypass_cache,
             excluded_ids=excluded_ids
         )
+        if user_services:
+            results = [
+                r for r in results
+                if _detail_matches_user_services(r.get("detail") or {}, user_services)
+            ]
         # Apply offset to fallback results
         paginated_results = results[offset:offset + top_n] if offset < len(results) else []
         return {"results": paginated_results, "count": len(paginated_results), "offset": offset, "has_more": len(results) > (offset + top_n)}
@@ -3240,7 +4118,8 @@ async def get_recommended_tv_v2(
     start_year: Optional[int] = None,
     end_year: Optional[int] = None,
     top_n: int = 5,
-    bypass_cache: bool = False
+    bypass_cache: bool = False,
+    only_my_services: bool = False,
 ):
     """
     Get TV show recommendations based on user preferences with caching and filtering.
@@ -3260,6 +4139,15 @@ async def get_recommended_tv_v2(
     # Get disliked TV show IDs to exclude from recommendations
     disliked_tv_ids = user_preferences.get("dislikedTvShowIds", [])
     excluded_ids = set(disliked_tv_ids) if disliked_tv_ids else None
+
+    user_services: Set[str] = set()
+    if only_my_services:
+        for svc in user_preferences.get("streamingServices", []) or []:
+            norm = _normalize_service_name(svc)
+            if norm:
+                user_services.add(norm)
+        if not user_services:
+            print("only_my_services=True but user has no streamingServices set; skipping filter")
     
     # Parse genres from comma-separated string
     genre_list = None
@@ -3290,6 +4178,8 @@ async def get_recommended_tv_v2(
                             continue
                     except Exception:
                         pass
+                if user_services and not _detail_matches_user_services(detail, user_services):
+                    continue
                 results.append({
                     "movie_id": tv_id,
                     "title": detail.get("name") or detail.get("original_name"),
@@ -3303,17 +4193,24 @@ async def get_recommended_tv_v2(
         # Fallback to dynamic recommendation (requires at least one TV preference)
         if not tv_ids:
             return {"results": [], "count": 0}
+        fetch_size = top_n * (4 if user_services else 1)
         results = get_similar_assets(
             asset_ids=set(tv_ids),
             asset_type="tv",
             genres=genre_list,
             start_year=start_year,
             end_year=end_year,
-            top_n=top_n,
+            top_n=max(fetch_size, top_n),
             read_from_local=False,
             bypass_cache=bypass_cache,
             excluded_ids=excluded_ids
         )
+        if user_services:
+            results = [
+                r for r in results
+                if _detail_matches_user_services(r.get("detail") or {}, user_services)
+            ]
+            results = results[:top_n]
         return {"results": results, "count": len(results)}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

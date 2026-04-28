@@ -66,7 +66,12 @@ def _get_db():
             cred = credentials.Certificate(service_account_path)
             firebase_admin.initialize_app(cred, {"projectId": project_id})
         else:
-            firebase_admin.initialize_app()
+            # No service-account file (e.g. running on Cloud Run with ADC).
+            # We still need to pin the Firebase project explicitly — otherwise
+            # firebase_admin falls back to the ADC project (the GCP project,
+            # not the Firebase project), which sends Firestore traffic to a
+            # database that doesn't exist there.
+            firebase_admin.initialize_app(options={"projectId": project_id})
 
     _db = firestore.client()
     return _db

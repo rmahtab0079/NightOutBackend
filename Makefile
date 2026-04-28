@@ -168,7 +168,7 @@ hourly-picks-create-topic:
 		echo "Topic $(HOURLY_PICKS_TOPIC) already exists."
 
 hourly-picks-create-scheduler:
-	@echo "Creating Cloud Scheduler job to send hourly picks at the top of every hour..."
+	@echo "Creating Cloud Scheduler job to send picks every 12 hours (00:00 & 12:00 ET)..."
 	@SERVICE_URL=$$(gcloud run services describe $(EVENTS_PARSER_SERVICE) \
 		--project $(PROJECT) --region $(REGION) --format='value(status.url)'); \
 	SA_EMAIL=$$(gcloud projects describe $(PROJECT) --format='value(projectNumber)'); \
@@ -176,7 +176,7 @@ hourly-picks-create-scheduler:
 	gcloud scheduler jobs create http hourly-picks-cron \
 		--project $(PROJECT) \
 		--location $(REGION) \
-		--schedule "0 * * * *" \
+		--schedule "0 */12 * * *" \
 		--uri "$$SERVICE_URL/send_hourly_picks" \
 		--http-method POST \
 		--oidc-service-account-email "$$SA_EMAIL" \
@@ -184,7 +184,20 @@ hourly-picks-create-scheduler:
 		--time-zone "America/New_York" \
 		--attempt-deadline 300s \
 		--quiet
-	@echo "Scheduler created: runs every hour (top of the hour, ET)."
+	@echo "Scheduler created: runs every 12 hours at 00:00 & 12:00 ET."
+
+# Use this to change the cadence on an EXISTING hourly-picks-cron job
+# without deleting and recreating it (which would lose any manual tweaks
+# made in the GCP console). The schedule below matches create-scheduler.
+hourly-picks-update-scheduler:
+	@echo "Updating hourly-picks-cron schedule to every 12 hours (00:00 & 12:00 ET)..."
+	@gcloud scheduler jobs update http hourly-picks-cron \
+		--project $(PROJECT) \
+		--location $(REGION) \
+		--schedule "0 */12 * * *" \
+		--time-zone "America/New_York" \
+		--quiet
+	@echo "Scheduler updated."
 
 hourly-picks-trigger:
 	@SERVICE_URL=$$(gcloud run services describe $(EVENTS_PARSER_SERVICE) \

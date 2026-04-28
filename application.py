@@ -1798,11 +1798,39 @@ _ALLOWED_SAVE_KINDS = {"movie", "tv", "event"}
 
 
 def _save_doc_id(kind: str, item_id: str) -> str:
-    """Stable Firestore doc id for a (kind, id) pair. Normalising both sides
-    means saving from a card with `id: 550` (int) and unsaving from a card
-    with `id: "550"` (string) hit the same document."""
+    """Stable Firestore doc id for a (kind, id) pair.
+
+    Beyond normalising int/str ids to the same bucket, we also have to
+    sanitise the value because Firestore document ids:
+      * cannot contain a forward slash (``/``) — interpreted as a path
+        separator,
+      * cannot be ``.`` or ``..`` (resolves to current/parent doc),
+      * have a 1500-byte UTF-8 length limit.
+
+    Curated event ids can come from restaurant names (e.g.
+    ``gp_tony's pizza & wine/bar``) or from the client-side ``name:<title>``
+    fallback, both of which can carry a slash. Without sanitising the id
+    here, the Firestore write either fails silently (via the Admin SDK) or
+    creates a malformed sub-collection path -- which surfaces to the user
+    as "save button doesn't work in production".
+    """
     safe_id = str(item_id).strip()
-    return f"{kind}_{safe_id}"
+    # Replace path-illegal chars with underscores. `__` collisions are fine
+    # because we still namespace by `kind` and the original (un-sanitised)
+    # id is also stored in the document body as `item_id` for display.
+    for ch in ("/", "\\", "\n", "\r", "\t"):
+        safe_id = safe_id.replace(ch, "_")
+    # Firestore disallows the doc ids "." and ".." outright; escape any id
+    # that is purely dots so we don't crash on the edge case.
+    if safe_id in {".", ".."}:
+        safe_id = safe_id.replace(".", "_")
+    if not safe_id:
+        safe_id = "unknown"
+    doc_id = f"{kind}_{safe_id}"
+    # Hard cap on length (Firestore doc id max is 1500 bytes; keep well below).
+    if len(doc_id.encode("utf-8")) > 1000:
+        doc_id = doc_id.encode("utf-8")[:1000].decode("utf-8", errors="ignore")
+    return doc_id
 
 
 @app.post("/saved_items/save")
@@ -1850,8 +1878,10 @@ async def save_item_for_later(
     except HTTPException:
         raise
     except Exception as e:
-        print(e)
-        raise HTTPException(status_code=500, detail=str(e))
+        import traceback
+        print(f"[/saved_items/save] failed for {email} kind={kind} id={item_id!r}: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"save failed: {e}")
 
 
 @app.post("/saved_items/unsave")
@@ -1891,8 +1921,10 @@ async def unsave_item_for_later(
     except HTTPException:
         raise
     except Exception as e:
-        print(e)
-        raise HTTPException(status_code=500, detail=str(e))
+        import traceback
+        print(f"[/saved_items/unsave] failed for {email} kind={kind} id={item_id!r}: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"unsave failed: {e}")
 
 
 @app.get("/saved_items")

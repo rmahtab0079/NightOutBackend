@@ -557,14 +557,21 @@ def run_pipeline(
         total_events += len(keyword_events)
 
         for user in cluster["users"]:
-            stats = _process_user_with_events(
-                user=user,
-                shared_events=shared_events,
-                keyword_events=keyword_events,
-                run_id=run_id,
-                radius_miles=radius_miles,
-                max_events_per_user=max_events_per_user,
-            )
+            email = user.get("email", "<unknown>")
+            try:
+                stats = _process_user_with_events(
+                    user=user,
+                    shared_events=shared_events,
+                    keyword_events=keyword_events,
+                    run_id=run_id,
+                    radius_miles=radius_miles,
+                    max_events_per_user=max_events_per_user,
+                )
+            except Exception as e:
+                # One bad event id / write must not abort curated lists for
+                # every remaining user in the cluster.
+                print(f"  [pipeline] failed for {email}: {e}")
+                continue
             if stats is None:
                 continue
             total_restaurants += stats["restaurants"]

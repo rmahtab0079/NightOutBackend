@@ -5,7 +5,7 @@ SERVICE ?= nightout-backend
 DOTENV_SECRET ?= app-dotenv
 DOTENV_MOUNT_PATH ?= /var/secrets/.env
 
-.PHONY: run docker-create docker-build deploy redeploy gcp-enable-apis dotenv-secret-create dotenv-upload cloud-run-update-dotenv secret-grant-access
+.PHONY: run docker-create docker-build docker-build-cloud deploy redeploy redeploy-all gcp-enable-apis dotenv-secret-create dotenv-upload cloud-run-update-dotenv secret-grant-access
 
 run:
 	uvicorn application:app --host 0.0.0.0 --port 8000 --reload
@@ -16,6 +16,25 @@ docker-create:
 docker-build:
 	docker buildx build --platform linux/amd64 -t $(IMAGE) --push .
 
+# Build + push the backend image via Google Cloud Build instead of the
+# local Docker daemon. Use this when Docker Desktop isn't running, when
+# you're on a network where buildx can't reach Artifact Registry, or
+# when you just want a faster build than your laptop can do.
+#
+# Honors `.gcloudignore` for what gets uploaded as the build context, so
+# `serviceAccount.json` (excluded by `.gitignore`) is shipped into the
+# image — required for the FastAPI app to talk to Firestore from Cloud
+# Run with the right project id.
+docker-build-cloud:
+	@echo "Building $(IMAGE) on Cloud Build (project=$(PROJECT))..."
+	gcloud builds submit \
+		--project $(PROJECT) \
+		--tag $(IMAGE) \
+		--machine-type=e2-highcpu-8 \
+		--timeout=1800s \
+		.
+	@echo "Image built and pushed: $(IMAGE)"
+
 deploy:
 	gcloud run deploy nightout-backend --image $(IMAGE) --project $(PROJECT) --region $(REGION) --allow-unauthenticated --quiet
 
@@ -23,6 +42,26 @@ deploy:
 # Use this whenever you've changed application.py and want the new code live.
 redeploy: docker-build deploy
 	@echo "Cloud Run service redeployed with latest code."
+
+# One-shot deploy of BOTH backend services using Google Cloud Build (so
+# this works without a local Docker daemon). Builds + ships the main
+# `nightout-backend` (FastAPI app — application.py) AND the
+# `events-parser` cron service (notifications + pipeline). Run this any
+# time changes touch shared modules under `service/` or both surfaces
+# need to ship together so they don't drift.
+#
+# Each step fails fast: if a build fails, no deploy runs for that
+# service, and the second service's deploy is skipped entirely.
+redeploy-all:
+	@echo "==> [1/4] Building nightout-backend image..."
+	$(MAKE) docker-build-cloud
+	@echo "==> [2/4] Deploying nightout-backend to Cloud Run..."
+	$(MAKE) cloud-run-update-dotenv
+	@echo "==> [3/4] Building events-parser image..."
+	$(MAKE) events-parser-docker-build-cloud
+	@echo "==> [4/4] Deploying events-parser to Cloud Run..."
+	$(MAKE) events-parser-deploy
+	@echo "==> Both services redeployed."
 
 # Read recent Cloud Run logs (most recent 100 lines, newest last).
 logs:
@@ -117,6 +156,18 @@ events-parser-docker-build:
 	docker buildx build --platform linux/amd64 \
 		-f Dockerfile.events_parser \
 		-t $(EVENTS_PARSER_IMAGE) --push .
+
+# Cloud Build counterpart to `events-parser-docker-build`. Same image,
+# same tag, but runs on Google Cloud Build so we don't need a local
+# Docker daemon. Driven by `cloudbuild.events_parser.yaml` because the
+# events-parser uses a non-default Dockerfile name.
+events-parser-docker-build-cloud:
+	@echo "Building $(EVENTS_PARSER_IMAGE) on Cloud Build (project=$(PROJECT))..."
+	gcloud builds submit \
+		--project $(PROJECT) \
+		--config cloudbuild.events_parser.yaml \
+		.
+	@echo "Image built and pushed: $(EVENTS_PARSER_IMAGE)"
 
 events-parser-deploy:
 	gcloud run deploy $(EVENTS_PARSER_SERVICE) \

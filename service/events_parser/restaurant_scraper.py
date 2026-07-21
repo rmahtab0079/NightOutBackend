@@ -9,8 +9,10 @@ user has matching dietary preferences.
 from __future__ import annotations
 
 import os
-import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
+
+import requests
 
 from .models import ScrapedEvent
 
@@ -134,7 +136,10 @@ def scrape_restaurants(
                 results.append(_place_to_event(p, tags, None))
                 dietary_count += 1
 
-        # For Halal, also search halal-adjacent cuisine types
+        # For Halal, also search cuisine types that *often* serve halal, but
+        # only keep / tag a place when name/summary actually mentions "halal".
+        # Blindly tagging every Pakistani/Turkish/etc. spot as halal was the
+        # main source of non-halal restaurants leaking into curated dining.
         if diet == "Halal":
             for adj_type in HALAL_ADJACENT_CUISINES:
                 adj_places = _search_places(
@@ -143,12 +148,16 @@ def scrape_restaurants(
                     max_results=10,
                 )
                 for p in adj_places:
-                    if p["name"] not in seen_names:
-                        seen_names.add(p["name"])
-                        cuisine_label = adj_type.replace("_restaurant", "").replace("_", " ")
-                        tags = ["food", "restaurant", "halal", cuisine_label]
-                        results.append(_place_to_event(p, tags, cuisine_label))
-                        dietary_count += 1
+                    if p["name"] in seen_names:
+                        continue
+                    text = f"{p.get('name') or ''} {p.get('summary') or ''}".lower()
+                    if "halal" not in text:
+                        continue
+                    seen_names.add(p["name"])
+                    cuisine_label = adj_type.replace("_restaurant", "").replace("_", " ")
+                    tags = ["food", "restaurant", "halal", cuisine_label]
+                    results.append(_place_to_event(p, tags, cuisine_label))
+                    dietary_count += 1
 
     if dietary_count:
         print(f"[restaurants] Dietary-specific searches added {dietary_count} restaurants")
@@ -181,6 +190,47 @@ def tag_dietary_matches(
     return restaurants
 
 
+def _resolve_place_photo_url(api_key: str, photo_name: str) -> Optional[str]:
+    """Resolve a Places photo resource to a durable googleusercontent CDN URL.
+
+    Storing `.../media?key=...` directly fails later with
+    `The photo resource in the request is invalid` once the resource name
+    goes stale — and the client then hides every restaurant card. Asking for
+    `skipHttpRedirect=true` returns a `photoUri` the app can load without an
+    API key.
+    """
+    if not photo_name:
+        return None
+    try:
+        media_url = (
+            f"https://places.googleapis.com/v1/{photo_name}/media"
+            f"?maxWidthPx=800&skipHttpRedirect=true"
+        )
+        resp = requests.get(
+            media_url,
+            headers={"X-Goog-Api-Key": api_key},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            uri = (resp.json() or {}).get("photoUri")
+            if isinstance(uri, str) and uri.startswith("http"):
+                return uri
+
+        # Fallback: follow the redirect Location header.
+        resp2 = requests.get(
+            f"https://places.googleapis.com/v1/{photo_name}/media?maxWidthPx=800",
+            headers={"X-Goog-Api-Key": api_key},
+            allow_redirects=False,
+            timeout=10,
+        )
+        loc = resp2.headers.get("location")
+        if resp2.status_code in (301, 302, 303, 307, 308) and loc:
+            return loc
+    except Exception as e:
+        print(f"[restaurants] photo resolve failed: {e}")
+    return None
+
+
 def _search_places(
     api_key: str,
     latitude: float,
@@ -192,6 +242,7 @@ def _search_places(
     """Call the Google Places searchNearby API."""
     endpoint = "https://places.googleapis.com/v1/places:searchNearby"
     field_mask = ",".join([
+        "places.id",
         "places.displayName",
         "places.formattedAddress",
         "places.rating",
@@ -228,18 +279,17 @@ def _search_places(
 
         data = resp.json()
         places = data.get("places", [])
-        results = []
-        for place in places:
+        # Resolve photo resource names -> durable CDN URLs in parallel so a
+        # cuisine search with ~20 hits doesn't serialize 20 media round-trips.
+        photo_jobs: dict[int, str] = {}
+        draft: list[dict] = []
+        for idx, place in enumerate(places):
             name = place.get("displayName", {}).get("text", "Unknown")
-            photo_url = None
             photos = place.get("photos", [])
             if photos:
                 ref = photos[0].get("name", "")
                 if ref:
-                    photo_url = (
-                        f"https://places.googleapis.com/v1/{ref}/media"
-                        f"?maxWidthPx=800&key={api_key}"
-                    )
+                    photo_jobs[idx] = ref
 
             price_str = place.get("priceLevel")
             price_int = {
@@ -251,13 +301,15 @@ def _search_places(
             }.get(price_str)
 
             loc = place.get("location", {})
+            place_id = (place.get("id") or "").strip()
 
-            results.append({
+            draft.append({
+                "place_id": place_id,
                 "name": name,
                 "address": place.get("formattedAddress"),
                 "rating": place.get("rating"),
                 "user_rating_count": place.get("userRatingCount"),
-                "photo_url": photo_url,
+                "photo_url": None,
                 "type": place.get("primaryType"),
                 "summary": place.get("editorialSummary", {}).get("text"),
                 "price_level": price_int,
@@ -266,7 +318,21 @@ def _search_places(
                 "latitude": loc.get("latitude"),
                 "longitude": loc.get("longitude"),
             })
-        return results
+
+        if photo_jobs:
+            with ThreadPoolExecutor(max_workers=min(8, len(photo_jobs))) as pool:
+                futures = {
+                    pool.submit(_resolve_place_photo_url, api_key, ref): idx
+                    for idx, ref in photo_jobs.items()
+                }
+                for fut in as_completed(futures):
+                    idx = futures[fut]
+                    try:
+                        draft[idx]["photo_url"] = fut.result()
+                    except Exception:
+                        draft[idx]["photo_url"] = None
+
+        return draft
     except Exception as e:
         print(f"[restaurants] Places API error: {e}")
         return []
@@ -278,9 +344,18 @@ def _place_to_event(
     cuisine: Optional[str],
 ) -> ScrapedEvent:
     """Convert a Google Places result dict into a ScrapedEvent."""
+    place_id = (place.get("place_id") or "").strip()
+    if place_id:
+        source_id = f"gp_{place_id}"
+    else:
+        # Fallback for older payloads / missing ids — strip path separators so
+        # Firestore catalog writes never see a `/` in the document id.
+        safe_name = place["name"].replace(" ", "_").replace("/", "_").lower()
+        source_id = f"gp_{safe_name}"
+
     return ScrapedEvent(
         source="google_places",
-        source_id=f"gp_{place['name'].replace(' ', '_').lower()}",
+        source_id=source_id,
         name=place["name"],
         venue_name=place["name"],
         venue_address=place.get("address"),

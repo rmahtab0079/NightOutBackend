@@ -211,6 +211,12 @@ def _score_restaurant(
         diet_matches = event_tags_lower & dietary_lower
 
         is_halal_user = "Halal" in user_dietary
+        # Hard exclude: Halal users should never see a restaurant that lacks
+        # an explicit halal signal. Soft penalties alone let non-halal spots
+        # still rank into the curated list.
+        if is_halal_user and "halal" not in diet_matches and "halal" not in event_text:
+            return 0.0
+
         if is_halal_user and "halal" in diet_matches:
             score += 2.0
             diet_matches = diet_matches - {"halal"}
@@ -224,7 +230,7 @@ def _score_restaurant(
         if is_halal_user:
             hard_non_halal = {"pork", "bacon", "ham"}
             if any(s in event_text for s in hard_non_halal):
-                score -= 1.5
+                return 0.0
             soft_non_halal = {"wine bar", "beer garden", "brewery", "brewpub", "hookah bar"}
             if event_tags_lower & soft_non_halal or any(s in event_text for s in soft_non_halal):
                 score -= 0.5

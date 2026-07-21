@@ -1,12 +1,13 @@
 from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
+import hashlib
 import logging
 import random
 import threading
 import time
 from pydantic import BaseModel
-from typing import Any, Dict, Optional, List, Set
+from typing import Any, Dict, Optional, List, Set, Tuple
 from dotenv import load_dotenv
 import requests
 import json
@@ -633,57 +634,176 @@ def search_nearby_events(
 
 @app.post("/night_out_events")
 async def get_night_out_events(req: NightOutEventRequest):
+    """
+    Find an activity/event near the user.
+
+    Coverage strategy:
+      1. Ticketmaster — search *every* selected interest (not one random pick)
+         and merge results.
+      2. Google Places — for place-based interests (museums, hiking, bowling,
+         karaoke, …) that TM often returns empty for, add venue results shaped
+         as activity suggestions.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from datetime import timedelta
+
     excluded = set(req.excluded_event_ids)
     max_event_price = BUDGET_TO_MAX_EVENT_PRICE.get(req.budget)
 
-    classification = req.classification
-    keyword = req.keyword
-
-    if not classification and not keyword and req.interests:
-        personalized = _personalized_event_params(req.interests)
-        classification = personalized.get("classification")
-        keyword = personalized.get("keyword")
-
-    from datetime import timedelta
     today = datetime.utcnow()
     default_start = req.start_date or today.strftime("%Y-%m-%dT%H:%M:%SZ")
     default_end = req.end_date or (today + timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
+    # Explicit classification/keyword from the client wins; otherwise fan out
+    # across all selected interests.
+    if req.classification or req.keyword:
+        tm_param_sets: list[dict[str, str | None]] = [{
+            "classification": req.classification,
+            "keyword": req.keyword,
+            "interest": None,
+        }]
+    else:
+        tm_param_sets = _event_search_params_for_interests(req.interests)
+
+    location = LocationData(latitude=req.latitude, longitude=req.longitude)
     MAX_RADIUS = 100.0
     current_radius = req.radius_miles
+    cache_key = _activity_pool_cache_key(
+        req.latitude,
+        req.longitude,
+        req.radius_miles,
+        req.interests,
+        req.classification,
+        req.keyword,
+    )
 
-    while current_radius <= MAX_RADIUS:
-        events = search_nearby_events(
-            latitude=req.latitude,
-            longitude=req.longitude,
-            radius_miles=current_radius,
-            classification=classification,
-            keyword=keyword,
-            start_date=default_start,
-            end_date=default_end,
+    cached = _get_cached_activity_pool(cache_key)
+    cache_hit = cached is not None
+    events: list[dict] = []
+
+    if cached is not None:
+        current_radius, events = cached
+        print(
+            f"[night_out_events] CACHE HIT key={cache_key!r} pool={len(events)} "
+            f"r={current_radius:.1f}mi"
         )
+    else:
+        while current_radius <= MAX_RADIUS:
+            # --- Ticketmaster (parallel per interest) ---
+            tm_groups: list[list[dict]] = []
 
-        if excluded:
-            events = [e for e in events if e["id"] not in excluded]
+            def _tm_search(params: dict[str, str | None]) -> list[dict]:
+                return search_nearby_events(
+                    latitude=req.latitude,
+                    longitude=req.longitude,
+                    radius_miles=current_radius,
+                    classification=params.get("classification"),
+                    keyword=params.get("keyword"),
+                    start_date=default_start,
+                    end_date=default_end,
+                    size=40,
+                )
 
-        if max_event_price is not None:
-            events = [
-                e for e in events
-                if e.get("min_price") is None or e["min_price"] <= max_event_price
-            ]
+            with ThreadPoolExecutor(max_workers=min(6, max(1, len(tm_param_sets)))) as pool:
+                futures = [pool.submit(_tm_search, p) for p in tm_param_sets]
+                for fut in as_completed(futures):
+                    try:
+                        tm_groups.append(fut.result())
+                    except Exception as e:
+                        print(f"[night_out_events] Ticketmaster search failed: {e}")
 
-        if events:
-            pick = random.choice(events)
-            pick["party_size"] = req.party_size
-            pick["budget"] = req.budget
-            pick["radius_used_miles"] = current_radius
-            return pick
+            events = _merge_event_results(*tm_groups)
+            tm_count = len(events)
 
-        current_radius *= 2
-        if current_radius > MAX_RADIUS:
-            raise HTTPException(status_code=404, detail="No events found nearby")
+            # --- Places fallback / supplement for venue-style activities ---
+            place_activities: list[dict] = []
+            interests_for_places = req.interests or []
+            if not interests_for_places and not req.classification and not req.keyword:
+                interests_for_places = [
+                    "Live Music", "Comedy Shows", "Museums", "Hiking", "Bowling",
+                ]
 
-    raise HTTPException(status_code=404, detail="No events found nearby")
+            place_jobs: list[tuple[str, list[str] | None, str | None]] = []
+            for interest in interests_for_places[:8]:
+                types = INTEREST_TO_PLACE_TYPES.get(interest)
+                if types:
+                    place_jobs.append((interest, types[:2], None))
+                for q in INTEREST_TO_TEXT_QUERIES.get(interest, [])[:2]:
+                    place_jobs.append((interest, None, q))
+
+            if place_jobs:
+                radius_m = min(max(current_radius * 1609.34, 100.0), 50000.0)
+
+                def _place_job(
+                    job: tuple[str, list[str] | None, str | None],
+                ) -> list[dict]:
+                    interest, types, query = job
+                    if types:
+                        raw = search_nearby_places(
+                            location, radius=radius_m, included_types=types
+                        )
+                    else:
+                        raw = search_text_places(
+                            location, query=query or "", radius=radius_m
+                        )
+                    return [_place_as_activity(p, interest=interest) for p in raw]
+
+                with ThreadPoolExecutor(
+                    max_workers=min(8, max(1, len(place_jobs)))
+                ) as pool:
+                    futures = [pool.submit(_place_job, j) for j in place_jobs]
+                    for fut in as_completed(futures):
+                        try:
+                            place_activities.extend(fut.result())
+                        except Exception as e:
+                            print(
+                                f"[night_out_events] Places activity search failed: {e}"
+                            )
+
+                events = _merge_event_results(events, place_activities)
+
+            print(
+                f"[night_out_events] CACHE MISS key={cache_key!r} "
+                f"r={current_radius:.1f}mi interests={req.interests} "
+                f"tm_params={len(tm_param_sets)} tm={tm_count} "
+                f"places={len(place_activities)} merged={len(events)}"
+            )
+
+            if events:
+                _set_cached_activity_pool(cache_key, current_radius, events)
+                cached_fresh = _get_cached_activity_pool(cache_key)
+                if cached_fresh is not None:
+                    current_radius, events = cached_fresh
+                break
+
+            current_radius *= 2
+            if current_radius > MAX_RADIUS:
+                raise HTTPException(status_code=404, detail="No events found nearby")
+
+    # Per-user filters after the shared cache.
+    if excluded:
+        events = [e for e in events if e.get("id") not in excluded]
+
+    if max_event_price is not None:
+        events = [
+            e for e in events
+            if e.get("min_price") is None or e["min_price"] <= max_event_price
+        ]
+
+    if not events:
+        if cache_hit:
+            with _ACTIVITY_POOL_LOCK:
+                _ACTIVITY_POOL_CACHE.pop(cache_key, None)
+        raise HTTPException(status_code=404, detail="No events found nearby")
+
+    pick = _stable_pick_activity(events, excluded, cache_key) or events[0]
+    pick = dict(pick)
+    pick["party_size"] = req.party_size
+    pick["budget"] = req.budget
+    pick["radius_used_miles"] = current_radius
+    pick["pool_size"] = len(events)
+    pick["cache_hit"] = cache_hit
+    return pick
 
 
 @app.post("/nearby_events_batch")
@@ -1051,6 +1171,32 @@ CUISINE_TO_PLACE_TYPES = {
     "Middle Eastern": ["middle_eastern_restaurant"],
 }
 
+# Google Places types that are first-class dietary categories. When the user
+# selects one of these, we search ONLY these types — never merge with generic
+# restaurant / cuisine results (that was how Halal kept surfacing non-halal spots).
+DIETARY_TO_PLACE_TYPES: dict[str, list[str]] = {
+    "Halal": ["halal_restaurant"],
+    "Vegetarian": ["vegetarian_restaurant"],
+    "Vegan": ["vegan_restaurant"],
+}
+
+# Place primaryTypes that are incompatible with a given dietary preference.
+# Used as a hard post-filter on live Places results.
+DIETARY_EXCLUDED_PRIMARY_TYPES: dict[str, set[str]] = {
+    "Halal": {
+        "bar", "wine_bar", "pub", "night_club", "liquor_store",
+        "seafood_restaurant",  # often non-halal by default
+    },
+    "Vegetarian": {
+        "steak_house", "barbecue_restaurant", "hamburger_restaurant",
+        "seafood_restaurant", "sushi_restaurant",
+    },
+    "Vegan": {
+        "steak_house", "barbecue_restaurant", "hamburger_restaurant",
+        "seafood_restaurant", "sushi_restaurant", "ice_cream_shop",
+    },
+}
+
 INTEREST_TO_PLACE_TYPES: dict[str, list[str]] = {
     "Soccer": ["sports_complex"],
     "Basketball": ["sports_complex"],
@@ -1117,16 +1263,221 @@ INTEREST_TO_TM_PARAMS: dict[str, dict[str, str]] = {
 def _personalized_place_types(
     cuisines: List[str],
     interests: List[str],
+    dietary_preferences: List[str] | None = None,
 ) -> list[str]:
+    """
+    Build the Places includedTypes list.
+
+    Strict dietary prefs (Halal / Vegetarian / Vegan) win: when any of those
+    are selected we search *only* the corresponding dietary place types so
+    adjacent-cuisine noise (e.g. random Pakistani spots tagged as "halal")
+    cannot leak into the result set.
+    """
+    dietary = dietary_preferences or []
+    dietary_types: list[str] = []
+    for d in dietary:
+        dietary_types.extend(DIETARY_TO_PLACE_TYPES.get(d, []))
+    if dietary_types:
+        return list(dict.fromkeys(dietary_types))
+
     types: list[str] = []
     for c in cuisines:
         types.extend(CUISINE_TO_PLACE_TYPES.get(c, []))
     for i in interests:
         types.extend(INTEREST_TO_PLACE_TYPES.get(i, []))
-    return list(dict.fromkeys(types)) if types else list(places_of_interest)
+    # Restaurant flow should default to restaurants, not bars/night clubs.
+    if types:
+        return list(dict.fromkeys(types))
+    if not interests and not cuisines:
+        return ["restaurant"]
+    return list(places_of_interest)
+
+
+def _place_type_set(place: dict) -> set[str]:
+    """All Google place types for a result (primary + types[]), lowercased."""
+    types: set[str] = set()
+    primary = (place.get("type") or "").strip().lower()
+    if primary:
+        types.add(primary)
+    for t in place.get("types") or []:
+        if isinstance(t, str) and t.strip():
+            types.add(t.strip().lower())
+    return types
+
+
+def _place_passes_dietary(place: dict, dietary_preferences: List[str]) -> bool:
+    """Hard post-filter for dietary constraints on live Places results."""
+    if not dietary_preferences:
+        return True
+    type_set = _place_type_set(place)
+    primary = (place.get("type") or "").lower()
+    name_summary = f"{place.get('name') or ''} {place.get('summary') or ''}".lower()
+
+    for diet in dietary_preferences:
+        excluded = DIETARY_EXCLUDED_PRIMARY_TYPES.get(diet, set())
+        # Only exclude when the place is *primarily* that type — many halal
+        # spots also list bar/cocktail_bar in types[] without being a bar.
+        if primary in excluded and diet.lower() not in name_summary:
+            # Still allow if Google tagged the dedicated dietary type.
+            dietary_types = {t.lower() for t in DIETARY_TO_PLACE_TYPES.get(diet, [])}
+            if not (type_set & dietary_types):
+                return False
+
+        if diet == "Halal":
+            # Accept if Google tagged halal_restaurant OR the name/summary
+            # explicitly says halal / zabiha. Do NOT require primaryType ==
+            # halal_restaurant — Places often returns primary=indian_restaurant
+            # / hamburger_restaurant with halal_restaurant only in types[].
+            has_halal_type = "halal_restaurant" in type_set
+            has_halal_text = ("halal" in name_summary) or ("zabiha" in name_summary)
+            if not has_halal_type and not has_halal_text:
+                return False
+            if any(bad in name_summary for bad in ("pork", "bacon", "ham ", " pig")):
+                return False
+    return True
+
+
+def _place_text_queries(
+    dietary_preferences: List[str] | None = None,
+    cuisines: List[str] | None = None,
+) -> list[str]:
+    """Text-search queries that catch spots Nearby type-search misses."""
+    queries: list[str] = []
+    dietary_preferences = dietary_preferences or []
+    cuisines = cuisines or []
+
+    for diet in dietary_preferences:
+        if diet == "Halal":
+            queries.append("halal restaurant")
+            queries.append("zabiha halal")
+            for cuisine in cuisines[:4]:
+                queries.append(f"halal {cuisine}")
+        elif diet == "Vegetarian":
+            queries.append("vegetarian restaurant")
+        elif diet == "Vegan":
+            queries.append("vegan restaurant")
+
+    # Cuisine text search roughly doubles coverage vs Nearby alone.
+    # Skip plain cuisine queries when a strict dietary type already owns
+    # the search (Halal/Veg/Vegan) — those use dietary-prefixed queries above.
+    has_strict_dietary = any(
+        d in DIETARY_TO_PLACE_TYPES for d in dietary_preferences
+    )
+    if not has_strict_dietary:
+        for cuisine in cuisines[:8]:
+            queries.append(f"{cuisine} restaurant")
+        if not cuisines and not dietary_preferences:
+            queries.append("restaurant")
+
+    return list(dict.fromkeys(queries))
+
+
+def _merge_place_results(*groups: list[dict]) -> list[dict]:
+    """Dedupe Places results by place_id, falling back to normalized name."""
+    merged: list[dict] = []
+    seen_ids: set[str] = set()
+    seen_names: set[str] = set()
+    for group in groups:
+        for place in group:
+            pid = (place.get("place_id") or "").strip()
+            name_key = (place.get("name") or "").strip().lower()
+            if pid and pid in seen_ids:
+                continue
+            if not pid and name_key and name_key in seen_names:
+                continue
+            if pid:
+                seen_ids.add(pid)
+            if name_key:
+                seen_names.add(name_key)
+            merged.append(place)
+    return merged
+
+
+def _collect_places_for_suggestion(
+    location: LocationData,
+    radius: float,
+    included_types: list[str],
+    text_queries: list[str],
+) -> tuple[list[dict], int]:
+    """
+    Fan out Nearby (per type) + Text searches in parallel and merge.
+
+    Nearby with many includedTypes still returns at most 20 total, so when
+    the user picks multiple cuisines we search each type separately. Text
+    search fills gaps Nearby misses for the same cuisine.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    # Cap fan-out so a user selecting every cuisine doesn't fire 30+ calls.
+    type_batches: list[list[str]] = []
+    if included_types:
+        # One Nearby call per type (or small group) for better coverage.
+        for t in included_types[:10]:
+            type_batches.append([t])
+    else:
+        type_batches.append(["restaurant"])
+
+    jobs: list[tuple[str, object]] = []
+    # (kind, callable args) — kind used only for logging
+    for batch in type_batches:
+        jobs.append(("nearby", (location, radius, batch)))
+    for query in text_queries[:10]:
+        jobs.append(("text", (location, query, radius)))
+
+    groups: list[list[dict]] = []
+    nearby_count = 0
+
+    def _run(kind: str, args: tuple):
+        if kind == "nearby":
+            loc, rad, types = args
+            return kind, search_nearby_places(loc, radius=rad, included_types=types)
+        loc, query, rad = args
+        return kind, search_text_places(loc, query=query, radius=rad)
+
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(jobs)))) as pool:
+        futures = [pool.submit(_run, kind, args) for kind, args in jobs]
+        for fut in as_completed(futures):
+            try:
+                kind, results = fut.result()
+            except Exception as e:
+                print(f"[night_out] place search failed: {e}")
+                continue
+            if kind == "nearby":
+                nearby_count += len(results)
+            groups.append(results)
+
+    return _merge_place_results(*groups), nearby_count
+
+
+# Text queries for place-based activities Ticketmaster rarely covers.
+INTEREST_TO_TEXT_QUERIES: dict[str, list[str]] = {
+    "Live Music": ["live music venue", "concert hall"],
+    "Comedy Shows": ["comedy club", "comedy show"],
+    "Theater": ["theater", "theatre"],
+    "Dance Clubs": ["nightclub", "dance club"],
+    "Karaoke": ["karaoke bar"],
+    "Art Galleries": ["art gallery"],
+    "Museums": ["museum"],
+    "Film Festivals": ["movie theater", "cinema"],
+    "Wine Tasting": ["wine bar", "wine tasting"],
+    "Cooking Classes": ["cooking class"],
+    "Brewery Tours": ["brewery"],
+    "Coffee Culture": ["coffee shop", "cafe"],
+    "Hiking": ["hiking trail", "hiking park"],
+    "Rock Climbing": ["climbing gym"],
+    "Kayaking": ["kayak rental", "kayaking"],
+    "Fishing": ["fishing pier", "fishing"],
+    "Camping": ["campground"],
+    "Bowling": ["bowling alley"],
+    "Golf": ["golf course"],
+    "Yoga": ["yoga studio"],
+    "Boxing": ["boxing gym"],
+    "Swimming": ["swimming pool"],
+}
 
 
 def _personalized_event_params(interests: List[str]) -> dict[str, str | None]:
+    """Legacy single-interest picker (kept for callers that expect one pair)."""
     if not interests:
         return {"classification": None, "keyword": None}
     pick = random.choice(interests)
@@ -1137,40 +1488,372 @@ def _personalized_event_params(interests: List[str]) -> dict[str, str | None]:
     }
 
 
+def _event_search_params_for_interests(
+    interests: List[str],
+) -> list[dict[str, str | None]]:
+    """One Ticketmaster (classification, keyword) pair per selected interest."""
+    if not interests:
+        return [{"classification": None, "keyword": None}]
+    params_list: list[dict[str, str | None]] = []
+    seen: set[tuple[str | None, str | None]] = set()
+    for interest in interests:
+        params = INTEREST_TO_TM_PARAMS.get(interest, {})
+        pair = (params.get("classification"), params.get("keyword"))
+        if pair in seen:
+            continue
+        seen.add(pair)
+        params_list.append({
+            "classification": pair[0],
+            "keyword": pair[1],
+            "interest": interest,
+        })
+    return params_list or [{"classification": None, "keyword": None}]
+
+
+def _merge_event_results(*groups: list[dict]) -> list[dict]:
+    merged: list[dict] = []
+    seen: set[str] = set()
+    for group in groups:
+        for event in group:
+            eid = (event.get("id") or "").strip()
+            name_key = (event.get("name") or "").strip().lower()
+            key = eid or f"name:{name_key}"
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            merged.append(event)
+    return merged
+
+
+def _place_as_activity(place: dict, interest: str | None = None) -> dict:
+    """Shape a Google Place as an activity/event suggestion for the client."""
+    place_id = (place.get("place_id") or "").strip()
+    name = place.get("name") or "Unknown"
+    return {
+        "id": place_id or f"place:{name}",
+        "name": name,
+        "description": place.get("summary"),
+        "image_url": place.get("photo_url"),
+        "date": None,
+        "time": None,
+        "venue_name": name,
+        "venue_address": place.get("address"),
+        "min_price": None,
+        "max_price": None,
+        "currency": None,
+        "segment": interest or place.get("type"),
+        "genre": place.get("type"),
+        "ticket_url": place.get("website_url") or place.get("google_maps_url"),
+        "source": "google_places",
+        "rating": place.get("rating"),
+        "types": place.get("types") or [],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Shared place-pool cache
+# Keyed by location bucket + radius + sorted cuisines/dietary so users with
+# the same filters reuse one Places fetch and see the same ordered results.
+# ---------------------------------------------------------------------------
+_PLACE_POOL_CACHE: dict[str, Tuple[float, float, list[dict]]] = {}
+# key -> (expires_at_epoch, radius_used_meters, places)
+_PLACE_POOL_LOCK = threading.Lock()
+_PLACE_POOL_TTL_SEC = 30 * 60  # 30 minutes
+_PLACE_POOL_MAX_ENTRIES = 256
+
+
+def _place_pool_cache_key(
+    latitude: float,
+    longitude: float,
+    radius_meters: float,
+    cuisines: List[str],
+    dietary_preferences: List[str],
+    interests: List[str] | None = None,
+) -> str:
+    # ~1km buckets so nearby users share a pool without over-sharing cities.
+    lat_b = round(float(latitude), 2)
+    lon_b = round(float(longitude), 2)
+    # Bucket radius to the nearest mile so tiny slider moves don't miss cache.
+    radius_mi = max(0.25, float(radius_meters) / 1609.34)
+    radius_b = round(radius_mi, 1)
+    cuisines_key = ",".join(sorted({c.strip() for c in cuisines if c and c.strip()}))
+    dietary_key = ",".join(
+        sorted({d.strip() for d in dietary_preferences if d and d.strip()})
+    )
+    interests_key = ",".join(
+        sorted({i.strip() for i in (interests or []) if i and i.strip()})
+    )
+    return (
+        f"lat={lat_b}|lon={lon_b}|r={radius_b}|"
+        f"c={cuisines_key}|d={dietary_key}|i={interests_key}"
+    )
+
+
+def _sort_place_pool(places: list[dict]) -> list[dict]:
+    """Stable ranking so every user with the same cache key sees the same order."""
+    return sorted(
+        places,
+        key=lambda p: (
+            -(p.get("rating") or 0.0),
+            -(p.get("user_rating_count") or 0),
+            (p.get("name") or "").lower(),
+        ),
+    )
+
+
+def _get_cached_place_pool(cache_key: str) -> Optional[Tuple[float, list[dict]]]:
+    now = time.time()
+    with _PLACE_POOL_LOCK:
+        entry = _PLACE_POOL_CACHE.get(cache_key)
+        if not entry:
+            return None
+        expires_at, radius_used, places = entry
+        if expires_at <= now or not places:
+            _PLACE_POOL_CACHE.pop(cache_key, None)
+            return None
+        # Return a shallow copy so callers can filter without mutating cache.
+        return radius_used, [dict(p) for p in places]
+
+
+def _set_cached_place_pool(
+    cache_key: str, radius_used: float, places: list[dict]
+) -> None:
+    if not places:
+        return
+    ordered = _sort_place_pool(places)
+    expires_at = time.time() + _PLACE_POOL_TTL_SEC
+    with _PLACE_POOL_LOCK:
+        if len(_PLACE_POOL_CACHE) >= _PLACE_POOL_MAX_ENTRIES:
+            # Drop expired first, then oldest insert order.
+            now = time.time()
+            expired = [k for k, (exp, _, _) in _PLACE_POOL_CACHE.items() if exp <= now]
+            for k in expired:
+                _PLACE_POOL_CACHE.pop(k, None)
+            while len(_PLACE_POOL_CACHE) >= _PLACE_POOL_MAX_ENTRIES:
+                _PLACE_POOL_CACHE.pop(next(iter(_PLACE_POOL_CACHE)))
+        _PLACE_POOL_CACHE[cache_key] = (expires_at, radius_used, ordered)
+
+
+def _stable_pick_place(
+    places: list[dict],
+    excluded_lower: set[str],
+    cache_key: str,
+) -> Optional[dict]:
+    """
+    Deterministic pick shared by all users on the same cache key for the day.
+    Walks the stable-ranked pool so "Next" (excluded names) advances the same way.
+    """
+    if not places:
+        return None
+    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    digest = hashlib.md5(f"{cache_key}|{day}".encode("utf-8")).hexdigest()
+    start = int(digest, 16) % len(places)
+    for offset in range(len(places)):
+        place = places[(start + offset) % len(places)]
+        name_key = (place.get("name") or "").strip().lower()
+        if name_key and name_key in excluded_lower:
+            continue
+        return place
+    return None
+
+
+# Activity/event pool cache — same idea, keyed by interests (+ location bucket).
+_ACTIVITY_POOL_CACHE: dict[str, Tuple[float, float, list[dict]]] = {}
+_ACTIVITY_POOL_LOCK = threading.Lock()
+_ACTIVITY_POOL_TTL_SEC = 20 * 60  # 20 minutes (events change more often)
+_ACTIVITY_POOL_MAX_ENTRIES = 256
+
+
+def _activity_pool_cache_key(
+    latitude: float,
+    longitude: float,
+    radius_miles: float,
+    interests: List[str],
+    classification: Optional[str],
+    keyword: Optional[str],
+) -> str:
+    lat_b = round(float(latitude), 2)
+    lon_b = round(float(longitude), 2)
+    radius_b = round(max(0.25, float(radius_miles)), 1)
+    interests_key = ",".join(sorted({i.strip() for i in interests if i and i.strip()}))
+    return (
+        f"lat={lat_b}|lon={lon_b}|r={radius_b}|"
+        f"i={interests_key}|class={classification or ''}|kw={keyword or ''}"
+    )
+
+
+def _sort_activity_pool(events: list[dict]) -> list[dict]:
+    return sorted(
+        events,
+        key=lambda e: (
+            (e.get("date") or "9999-99-99"),
+            (e.get("name") or "").lower(),
+            (e.get("id") or ""),
+        ),
+    )
+
+
+def _get_cached_activity_pool(
+    cache_key: str,
+) -> Optional[Tuple[float, list[dict]]]:
+    now = time.time()
+    with _ACTIVITY_POOL_LOCK:
+        entry = _ACTIVITY_POOL_CACHE.get(cache_key)
+        if not entry:
+            return None
+        expires_at, radius_used, events = entry
+        if expires_at <= now or not events:
+            _ACTIVITY_POOL_CACHE.pop(cache_key, None)
+            return None
+        return radius_used, [dict(e) for e in events]
+
+
+def _set_cached_activity_pool(
+    cache_key: str, radius_used: float, events: list[dict]
+) -> None:
+    if not events:
+        return
+    ordered = _sort_activity_pool(events)
+    expires_at = time.time() + _ACTIVITY_POOL_TTL_SEC
+    with _ACTIVITY_POOL_LOCK:
+        if len(_ACTIVITY_POOL_CACHE) >= _ACTIVITY_POOL_MAX_ENTRIES:
+            now = time.time()
+            expired = [
+                k for k, (exp, _, _) in _ACTIVITY_POOL_CACHE.items() if exp <= now
+            ]
+            for k in expired:
+                _ACTIVITY_POOL_CACHE.pop(k, None)
+            while len(_ACTIVITY_POOL_CACHE) >= _ACTIVITY_POOL_MAX_ENTRIES:
+                _ACTIVITY_POOL_CACHE.pop(next(iter(_ACTIVITY_POOL_CACHE)))
+        _ACTIVITY_POOL_CACHE[cache_key] = (expires_at, radius_used, ordered)
+
+
+def _stable_pick_activity(
+    events: list[dict],
+    excluded_ids: set[str],
+    cache_key: str,
+) -> Optional[dict]:
+    if not events:
+        return None
+    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    digest = hashlib.md5(f"{cache_key}|{day}".encode("utf-8")).hexdigest()
+    start = int(digest, 16) % len(events)
+    for offset in range(len(events)):
+        event = events[(start + offset) % len(events)]
+        eid = (event.get("id") or "").strip()
+        if eid and eid in excluded_ids:
+            continue
+        return event
+    return None
+
+
 @app.post("/night_out_suggestion")
 async def get_night_out_suggestion(req: NightOutSuggestionRequest):
-    included_types = _personalized_place_types(req.cuisines, req.interests)
+    included_types = _personalized_place_types(
+        req.cuisines,
+        req.interests,
+        dietary_preferences=req.dietary_preferences,
+    )
 
     location = LocationData(latitude=req.latitude, longitude=req.longitude)
-    excluded = set(req.excluded_names)
+    excluded = {n.strip() for n in req.excluded_names if n and n.strip()}
+    excluded_lower = {n.lower() for n in excluded}
     max_price = BUDGET_TO_MAX_PRICE_LEVEL.get(req.budget)
+    text_queries = _place_text_queries(req.dietary_preferences, req.cuisines)
 
     MAX_RADIUS = 50000.0
     current_radius = req.radius_meters
+    cache_key = _place_pool_cache_key(
+        req.latitude,
+        req.longitude,
+        req.radius_meters,
+        req.cuisines,
+        req.dietary_preferences,
+        req.interests,
+    )
 
-    while current_radius <= MAX_RADIUS:
-        places = search_nearby_places(location, radius=current_radius, included_types=included_types)
+    cached = _get_cached_place_pool(cache_key)
+    cache_hit = cached is not None
+    nearby_count = 0
+    before_filters = 0
 
-        if excluded:
-            places = [p for p in places if p["name"] not in excluded]
+    if cached is not None:
+        current_radius, places = cached
+        before_filters = len(places)
+        print(
+            f"[night_out] CACHE HIT key={cache_key!r} pool={before_filters} "
+            f"r={current_radius:.0f}m"
+        )
+    else:
+        places = []
+        while current_radius <= MAX_RADIUS:
+            places, nearby_count = _collect_places_for_suggestion(
+                location=location,
+                radius=current_radius,
+                included_types=included_types,
+                text_queries=text_queries,
+            )
+            before_filters = len(places)
 
-        if max_price is not None:
-            places = [
-                p for p in places
-                if p.get("price_level") is None or p["price_level"] <= max_price
-            ]
+            # Dietary filter before caching so the shared pool is already clean
+            # for Halal/Veg/Vegan users with this key.
+            if req.dietary_preferences and places:
+                places = [
+                    p for p in places
+                    if _place_passes_dietary(p, req.dietary_preferences)
+                ]
 
-        if places:
-            break
+            if places:
+                _set_cached_place_pool(cache_key, current_radius, places)
+                # Re-read so we serve the canonical sorted copy.
+                cached_fresh = _get_cached_place_pool(cache_key)
+                if cached_fresh is not None:
+                    current_radius, places = cached_fresh
+                break
 
-        current_radius *= 2
-        if current_radius > MAX_RADIUS:
-            raise HTTPException(status_code=404, detail="No places found nearby")
+            current_radius *= 2
+            if current_radius > MAX_RADIUS:
+                raise HTTPException(status_code=404, detail="No places found nearby")
 
-    pick = random.choice(places)
+        print(
+            f"[night_out] CACHE MISS key={cache_key!r} "
+            f"types={included_types} text_queries={text_queries} "
+            f"nearby_raw={nearby_count} merged={before_filters} "
+            f"cached_pool={len(places)} r={current_radius:.0f}m"
+        )
+
+    # Per-request filters (history / budget) — applied after the shared cache.
+    if excluded_lower:
+        places = [
+            p for p in places
+            if (p.get("name") or "").strip().lower() not in excluded_lower
+        ]
+
+    if max_price is not None:
+        places = [
+            p for p in places
+            if p.get("price_level") is None or p["price_level"] <= max_price
+        ]
+
+    if not places:
+        # Cached pool may be fully excluded for this user — bust and retry once
+        # only when we started from a hit (otherwise we'd loop forever).
+        if cache_hit:
+            with _PLACE_POOL_LOCK:
+                _PLACE_POOL_CACHE.pop(cache_key, None)
+            raise HTTPException(
+                status_code=404,
+                detail="No places found nearby",
+            )
+        raise HTTPException(status_code=404, detail="No places found nearby")
+
+    pick = _stable_pick_place(places, excluded_lower, cache_key) or places[0]
+    pick = dict(pick)
     pick["party_size"] = req.party_size
     pick["budget"] = req.budget
     pick["radius_used"] = current_radius
+    pick["pool_size"] = len(places)
+    pick["cache_hit"] = cache_hit
     return pick
 
 @app.get("/find_similar_movie")
@@ -2236,7 +2919,10 @@ async def get_event_from_catalog(
     if firebase_db is None:
         raise HTTPException(status_code=501, detail="Firebase not configured")
     _verify_and_get_user(authorization)
-    doc = firebase_db.collection(PARSED_EVENTS_CATALOG_COLLECTION).document(catalog_id).get()
+    from service.events_parser.firebase_writer import sanitize_firestore_doc_id
+
+    safe_id = sanitize_firestore_doc_id(catalog_id)
+    doc = firebase_db.collection(PARSED_EVENTS_CATALOG_COLLECTION).document(safe_id).get()
     if not doc.exists:
         raise HTTPException(status_code=404, detail="Event not found in catalog")
     return doc.to_dict()
@@ -3913,28 +4599,69 @@ async def get_random_suggestion_get(latitude: float, longitude: float):
     return Suggestion(suggestion="Visit " + pick["name"])
 
 
+_PLACES_FIELD_MASK = ",".join([
+    "places.id",
+    "places.displayName",
+    "places.formattedAddress",
+    "places.rating",
+    "places.userRatingCount",
+    "places.photos",
+    "places.primaryType",
+    "places.types",
+    "places.editorialSummary",
+    "places.priceLevel",
+    "places.websiteUri",
+    "places.googleMapsUri",
+])
+
+
+def _normalize_place_result(place: dict) -> dict:
+    """Convert a Places API place resource into our suggestion dict."""
+    name = place.get("displayName", {}).get("text", "Unknown")
+    photo_url = None
+    photos = place.get("photos", [])
+    if photos:
+        photo_ref = photos[0].get("name", "")
+        if photo_ref:
+            photo_url = (
+                f"https://places.googleapis.com/v1/{photo_ref}/media"
+                f"?maxWidthPx=800&key={api_key}"
+            )
+    price_str = place.get("priceLevel")
+    price_int = {
+        "PRICE_LEVEL_FREE": 0,
+        "PRICE_LEVEL_INEXPENSIVE": 1,
+        "PRICE_LEVEL_MODERATE": 2,
+        "PRICE_LEVEL_EXPENSIVE": 3,
+        "PRICE_LEVEL_VERY_EXPENSIVE": 4,
+    }.get(price_str)
+
+    return {
+        "place_id": place.get("id"),
+        "name": name,
+        "address": place.get("formattedAddress"),
+        "rating": place.get("rating"),
+        "user_rating_count": place.get("userRatingCount"),
+        "photo_url": photo_url,
+        "type": place.get("primaryType"),
+        "types": place.get("types") or [],
+        "summary": place.get("editorialSummary", {}).get("text"),
+        "price_level": price_int,
+        "website_url": place.get("websiteUri"),
+        "google_maps_url": place.get("googleMapsUri"),
+    }
+
+
 def search_nearby_places(
     location: LocationData,
     radius: float = 10000.0,
     included_types: List[str] | None = None,
 ) -> List[dict]:
     endpoint_url = "https://places.googleapis.com/v1/places:searchNearby"
-    field_mask = ",".join([
-        "places.displayName",
-        "places.formattedAddress",
-        "places.rating",
-        "places.userRatingCount",
-        "places.photos",
-        "places.primaryType",
-        "places.editorialSummary",
-        "places.priceLevel",
-        "places.websiteUri",
-        "places.googleMapsUri",
-    ])
     headers = {
         "Content-Type": "application/json",
         "X-Goog-Api-Key": api_key,
-        "X-Goog-FieldMask": field_mask,
+        "X-Goog-FieldMask": _PLACES_FIELD_MASK,
     }
     json_payload = {
         "includedTypes": included_types or places_of_interest,
@@ -3950,45 +4677,52 @@ def search_nearby_places(
     }
 
     try:
-        response = requests.post(endpoint_url, json=json_payload, headers=headers)
+        response = requests.post(endpoint_url, json=json_payload, headers=headers, timeout=15)
         response_dict = response.json()
         places = response_dict.get("places", [])
-        results = []
-        for place in places:
-            name = place.get("displayName", {}).get("text", "Unknown")
-            photo_url = None
-            photos = place.get("photos", [])
-            if photos:
-                photo_ref = photos[0].get("name", "")
-                if photo_ref:
-                    photo_url = (
-                        f"https://places.googleapis.com/v1/{photo_ref}/media"
-                        f"?maxWidthPx=800&key={api_key}"
-                    )
-            price_str = place.get("priceLevel")
-            price_int = {
-                "PRICE_LEVEL_FREE": 0,
-                "PRICE_LEVEL_INEXPENSIVE": 1,
-                "PRICE_LEVEL_MODERATE": 2,
-                "PRICE_LEVEL_EXPENSIVE": 3,
-                "PRICE_LEVEL_VERY_EXPENSIVE": 4,
-            }.get(price_str)
-
-            results.append({
-                "name": name,
-                "address": place.get("formattedAddress"),
-                "rating": place.get("rating"),
-                "user_rating_count": place.get("userRatingCount"),
-                "photo_url": photo_url,
-                "type": place.get("primaryType"),
-                "summary": place.get("editorialSummary", {}).get("text"),
-                "price_level": price_int,
-                "website_url": place.get("websiteUri"),
-                "google_maps_url": place.get("googleMapsUri"),
-            })
-        return results
+        return [_normalize_place_result(place) for place in places]
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def search_text_places(
+    location: LocationData,
+    query: str,
+    radius: float = 10000.0,
+    max_results: int = 20,
+) -> List[dict]:
+    """Places Text Search (New) — complementary to searchNearby for dietary queries."""
+    if not query or not query.strip():
+        return []
+    endpoint_url = "https://places.googleapis.com/v1/places:searchText"
+    headers = {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": api_key,
+        "X-Goog-FieldMask": _PLACES_FIELD_MASK,
+    }
+    json_payload = {
+        "textQuery": query.strip(),
+        "maxResultCount": min(max(max_results, 1), 20),
+        "locationBias": {
+            "circle": {
+                "center": {
+                    "latitude": location.latitude,
+                    "longitude": location.longitude,
+                },
+                "radius": min(max(radius, 100.0), 50000.0),
+            }
+        },
+    }
+    try:
+        response = requests.post(endpoint_url, json=json_payload, headers=headers, timeout=15)
+        if response.status_code != 200:
+            print(f"[places:text] {response.status_code} for query={query!r}: {response.text[:200]}")
+            return []
+        places = response.json().get("places", [])
+        return [_normalize_place_result(place) for place in places]
+    except Exception as e:
+        print(f"[places:text] error for query={query!r}: {e}")
+        return []
 
 
 @app.get('/movie_genres')

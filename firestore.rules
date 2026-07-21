@@ -41,5 +41,25 @@ service cloud.firestore {
                   && request.auth.token.email == email;
       allow write: if false;
     }
+
+    // Saved-for-later items.
+    //
+    // Writes always go through the backend (`/saved_items/save` and
+    // `/saved_items/unsave`) using the Admin SDK, but the client opens a
+    // live Firestore listener on the items sub-collection to keep the
+    // bookmark icon in sync across devices. Without this rule that listener
+    // fails with `permission-denied` and cross-device sync silently breaks
+    // (saves still work, but only become visible after app restart).
+    match /user_saved_items/{email} {
+      allow read: if request.auth != null
+                  && request.auth.token.email == email;
+      allow write: if false;
+
+      match /items/{itemId} {
+        allow read: if request.auth != null
+                    && request.auth.token.email == email;
+        allow write: if false;
+      }
+    }
   }
 }

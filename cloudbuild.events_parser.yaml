@@ -1,0 +1,20 @@
+# Cloud Build config for the EventsParser service.
+#
+# We can't use `gcloud builds submit --tag ...` because that path only
+# works with the default `Dockerfile` filename and the events-parser
+# uses `Dockerfile.events_parser`. Hence this explicit two-step config
+# (build + push) which Make invokes via `events-parser-docker-build-cloud`.
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -f
+      - Dockerfile.events_parser
+      - -t
+      - us-east1-docker.pkg.dev/optimal-aegis-470701-j8/containers/events-parser:latest
+      - .
+images:
+  - us-east1-docker.pkg.dev/optimal-aegis-470701-j8/containers/events-parser:latest
+options:
+  machineType: E2_HIGHCPU_8
+timeout: 1800s

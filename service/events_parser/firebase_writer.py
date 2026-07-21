@@ -100,13 +100,27 @@ def get_user_swipe_categories(email: str) -> set[str]:
 PARSED_EVENTS_CATALOG_COLLECTION = "parsed_events_catalog"
 
 
+def sanitize_firestore_doc_id(raw: str) -> str:
+    """Firestore characters that Firestore treats as path separators.
+
+    Document ids may not contain `/`. Eventbrite JSON-LD fallbacks use the
+    event URL as `source_id`, and some venue names include slashes
+    ("Cafe A/B"). Passing those through to `.document(...)` makes Firestore
+    interpret the id as a nested path and raises:
+    `A document must have an even number of path elements` — which previously
+    aborted the entire events parser pipeline before any curated food list
+    could be written.
+    """
+    return (raw or "").replace("/", "_")
+
+
 def _event_catalog_id(event: dict) -> str | None:
     """Generate a stable document id for the event catalog (source:source_id)."""
     source = (event.get("source") or "").strip()
     source_id = (event.get("source_id") or event.get("name") or "").strip()
     if not source or not source_id:
         return None
-    return f"{source}:{source_id}"
+    return sanitize_firestore_doc_id(f"{source}:{source_id}")
 
 
 def write_parsed_events_to_catalog(events: list[dict]) -> None:
@@ -117,14 +131,26 @@ def write_parsed_events_to_catalog(events: list[dict]) -> None:
     db = _get_db()
     coll = db.collection(PARSED_EVENTS_CATALOG_COLLECTION)
     now = datetime.utcnow().isoformat() + "Z"
+    written = 0
+    skipped = 0
     for event in events:
         doc_id = _event_catalog_id(event)
         if not doc_id:
+            skipped += 1
             continue
         payload = {**event, "last_updated": now}
-        coll.document(doc_id).set(payload)
+        try:
+            coll.document(doc_id).set(payload)
+            written += 1
+        except Exception as e:
+            skipped += 1
+            print(f"  [firebase] catalog write skipped for {doc_id!r}: {e}")
     if events:
-        print(f"  [firebase] Wrote {len(events)} events to {PARSED_EVENTS_CATALOG_COLLECTION}")
+        print(
+            f"  [firebase] Wrote {written} events to "
+            f"{PARSED_EVENTS_CATALOG_COLLECTION}"
+            + (f" (skipped {skipped})" if skipped else "")
+        )
 
 
 def write_curated_events(

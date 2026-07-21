@@ -222,9 +222,17 @@ def _extract_json_ld_events(html: str) -> list[ScrapedEvent]:
             else:
                 date_str = start_date or None
 
+            raw_url = item.get("url") or ""
+            # Prefer a path-safe id: Eventbrite URLs contain `/` which Firestore
+            # rejects as document ids. Fall back to a sanitized URL slug.
+            eb_id = ""
+            if "/e/" in raw_url:
+                eb_id = raw_url.rstrip("/").split("/e/")[-1].split("?")[0]
+            source_id = eb_id or raw_url.replace("/", "_") or item.get("name", "unknown")
+
             results.append(ScrapedEvent(
                 source="eventbrite",
-                source_id=item.get("url", ""),
+                source_id=source_id,
                 name=item.get("name", "Unknown"),
                 date=date_str,
                 time=time_str,

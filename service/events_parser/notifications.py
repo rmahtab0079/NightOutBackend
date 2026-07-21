@@ -103,16 +103,18 @@ def _event_id(event: dict) -> Optional[str]:
     are missing so curated events scraped from less structured providers
     still get a stable key.
     """
+    from .firebase_writer import sanitize_firestore_doc_id
+
     source = (event.get("source") or "").strip()
     sid = (event.get("source_id") or "").strip()
     if source and sid:
-        return f"{source}:{sid}"
+        return sanitize_firestore_doc_id(f"{source}:{sid}")
 
     name = (event.get("name") or event.get("title") or "").strip()
     if not name:
         return None
     when = (event.get("date") or event.get("start_date") or "").strip()
-    return f"name:{name}|{when}"
+    return sanitize_firestore_doc_id(f"name:{name}|{when}")
 
 
 def _build_event_pool(curated_doc: dict) -> list[dict]:

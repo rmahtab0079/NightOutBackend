@@ -13,7 +13,14 @@ import os
 import sys
 from dotenv import load_dotenv
 
-load_dotenv()
+# Cloud Run mounts Secret Manager at DOTENV_PATH (/var/secrets/.env).
+# Bare load_dotenv() only looks for ./.env, which is absent in the container —
+# so GOOGLE_PLACES_API_KEY never loads and every cron run writes 0 restaurants.
+dotenv_path = os.getenv("DOTENV_PATH")
+if dotenv_path:
+    load_dotenv(dotenv_path)
+else:
+    load_dotenv()
 
 from fastapi import FastAPI, HTTPException, Header
 from typing import Optional

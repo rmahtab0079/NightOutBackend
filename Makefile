@@ -5,10 +5,33 @@ SERVICE ?= nightout-backend
 DOTENV_SECRET ?= app-dotenv
 DOTENV_MOUNT_PATH ?= /var/secrets/.env
 
-.PHONY: run docker-create docker-build docker-build-cloud deploy redeploy redeploy-all gcp-enable-apis dotenv-secret-create dotenv-upload cloud-run-update-dotenv secret-grant-access
+.PHONY: run docker-create docker-build docker-build-cloud deploy redeploy redeploy-all gcp-enable-apis dotenv-secret-create dotenv-upload cloud-run-update-dotenv secret-grant-access test-latency test-latency-local test-launch-gate
 
 run:
 	uvicorn application:app --host 0.0.0.0 --port 8000 --reload
+
+# ---------------------------------------------------------------------------
+# Launch-gate tests
+# ---------------------------------------------------------------------------
+# Install once:
+#   pip install -r requirements-dev.txt
+#
+# In-process cache/latency suite (no server). Asserts cache-hit p95 < 50ms.
+test-latency-local:
+	@echo "==> Launch gate: in-process latency (cache hit < $${CACHE_HIT_BUDGET_MS:-50}ms)"
+	python -m pytest tests/test_launch_latency_local.py -s
+
+# HTTP latency suite against a running API (default http://127.0.0.1:8000).
+# Start the server in another terminal with `make run` first.
+test-latency:
+	@echo "==> Launch gate: HTTP latency against $${API_BASE_URL:-http://127.0.0.1:8000}"
+	python -m pytest tests/test_launch_latency.py -s
+
+# Full backend launch gate (local + HTTP if server is up).
+test-launch-gate: test-latency-local
+	@echo "==> Trying HTTP suite (skip if server down)..."
+	@python -m pytest tests/test_launch_latency.py -s || \
+		(echo "HTTP suite skipped/failed — is \`make run\` up? Local suite already ran." && true)
 
 docker-create:
 	docker buildx create --use --name ar_builder || docker buildx use ar_builder

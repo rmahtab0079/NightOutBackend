@@ -146,6 +146,13 @@ def _url_is_reachable(url: str) -> bool:
     Places photo media endpoints return 404 on HEAD even when GET succeeds), so
     if HEAD doesn't return 2xx we always fall through to a ranged GET.
     """
+    # Google Places photo resolve already handed us a durable CDN URL. Probing
+    # these from Cloud Run frequently fails with transient SSL EOFs and then
+    # we drop every restaurant (0 dining on home). Trust the CDN host.
+    lowered = (url or "").lower()
+    if "googleusercontent.com" in lowered or "ggpht.com" in lowered:
+        return True
+
     try:
         r = requests.head(
             url,

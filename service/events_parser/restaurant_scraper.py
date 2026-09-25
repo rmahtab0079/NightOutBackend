@@ -78,6 +78,9 @@ def scrape_restaurants(
     in ranked order. If dietary preferences are provided, runs additional
     dedicated searches (e.g. ``halal_restaurant``) and auto-tags results.
     """
+    if os.getenv("ENABLE_GOOGLE_PLACES", "true").lower() != "true":
+        print("[restaurants] Google Places disabled (ENABLE_GOOGLE_PLACES), skipping")
+        return []
     api_key = os.getenv("GOOGLE_PLACES_API_KEY", "")
     if not api_key:
         print("[restaurants] No Google Places API key, skipping")

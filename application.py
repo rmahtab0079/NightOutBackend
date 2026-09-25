@@ -4,6 +4,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 import hashlib
 import logging
 import random
+import re
 import threading
 import time
 from pydantic import BaseModel
@@ -87,7 +88,14 @@ if os.getenv("ENABLE_GENRE_RECS_JOB", "true").lower() == "true":
     async def _start_genre_recs_job():
         start_genre_recommendation_scheduler(interval_seconds=300)
 
-api_key = "AIzaSyDW0X1gO6uVSPkYIa3R6sjRwNQrz-afYU0"
+api_key = os.getenv("GOOGLE_PLACES_API_KEY", "")
+# When false, no Google Places requests are made; every place search is served
+# from the static list in STATIC_PLACES_PATH instead.
+GOOGLE_PLACES_ENABLED = os.getenv("ENABLE_GOOGLE_PLACES", "true").lower() == "true"
+STATIC_PLACES_PATH = os.getenv(
+    "STATIC_PLACES_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "static_places.json"),
+)
 ticketmaster_api_key = os.getenv("TICKETMASTER_API_KEY", "")
 tmdb_api_key = os.getenv("TMDB_API_KEY", "")
 # Watchmode API for streaming deeplinks (Netflix, Amazon Prime, etc.). Override with WATCHMODE_API_KEY in .env.
@@ -797,7 +805,7 @@ async def get_night_out_events(req: NightOutEventRequest):
         raise HTTPException(status_code=404, detail="No events found nearby")
 
     pick = _stable_pick_activity(events, excluded, cache_key) or events[0]
-    pick = dict(pick)
+    pick = _attach_activity_image_url(pick)
     pick["party_size"] = req.party_size
     pick["budget"] = req.budget
     pick["radius_used_miles"] = current_radius
@@ -842,7 +850,7 @@ class NearbyPlacesBatchRequest(BaseModel):
 async def get_nearby_places_batch(req: NearbyPlacesBatchRequest):
     location = LocationData(latitude=req.latitude, longitude=req.longitude)
     places = search_nearby_places(location, radius=req.radius_meters)
-    return {"places": places}
+    return {"places": _attach_photo_urls(places)}
 
 
 @app.get("/event_classifications")
@@ -1533,7 +1541,9 @@ def _place_as_activity(place: dict, interest: str | None = None) -> dict:
         "id": place_id or f"place:{name}",
         "name": name,
         "description": place.get("summary"),
+        # Resolved at pick time — see `_attach_activity_image_url`.
         "image_url": place.get("photo_url"),
+        "photo_ref": place.get("photo_ref"),
         "date": None,
         "time": None,
         "venue_name": name,
@@ -1548,6 +1558,21 @@ def _place_as_activity(place: dict, interest: str | None = None) -> dict:
         "rating": place.get("rating"),
         "types": place.get("types") or [],
     }
+
+
+def _attach_activity_image_url(activity: dict) -> dict:
+    """Return a copy of `activity` with a Places image resolved if it needs one.
+
+    Ticketmaster activities already carry an `image_url` and pass through
+    untouched; only google_places entries hold a `photo_ref`.
+    """
+    if not activity:
+        return activity
+    out = dict(activity)
+    photo_ref = out.pop("photo_ref", "") or ""
+    if not out.get("image_url") and photo_ref:
+        out["image_url"] = _resolve_place_photo_url(photo_ref)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1848,7 +1873,7 @@ async def get_night_out_suggestion(req: NightOutSuggestionRequest):
         raise HTTPException(status_code=404, detail="No places found nearby")
 
     pick = _stable_pick_place(places, excluded_lower, cache_key) or places[0]
-    pick = dict(pick)
+    pick = _attach_photo_url(pick)
     pick["party_size"] = req.party_size
     pick["budget"] = req.budget
     pick["radius_used"] = current_radius
@@ -3662,6 +3687,8 @@ async def list_auth_users(
             pass
 
     exclude_uids = my_friend_uids | pending_with | {current_uid}
+    if firebase_db:
+        exclude_uids |= _blocked_uids_for(current_uid)
     users = []
     for user in page.users:
         if user.uid in exclude_uids:
@@ -3695,6 +3722,8 @@ async def send_friend_request(
     to_uid = (req.to_uid or "").strip()
     if not to_uid or to_uid == from_uid:
         raise HTTPException(status_code=400, detail="Invalid to_uid")
+    if to_uid in _blocked_uids_for(from_uid) or from_uid in _blocked_uids_for(to_uid):
+        raise HTTPException(status_code=403, detail="Cannot send request to this user")
 
     # Already friends?
     from_friend_doc = firebase_db.collection(FRIENDS_COLLECTION).document(from_uid).get()
@@ -3742,12 +3771,18 @@ async def get_incoming_friend_requests(authorization: Optional[str] = Header(def
     if not to_uid:
         raise HTTPException(status_code=400, detail="UID not found in token")
 
+    blocked = _blocked_uids_for(to_uid)
+    hidden_ids = _hidden_content_ids_for(to_uid)
     snapshot = firebase_db.collection(FRIEND_REQUESTS_COLLECTION).where(
         "to_uid", "==", to_uid
     ).where("status", "==", "pending").stream()
     requests = []
     for doc in snapshot:
         data = doc.to_dict()
+        if doc.id in hidden_ids or (data.get("from_uid") or "") in blocked:
+            continue
+        if _text_is_objectionable(data.get("from_display_name")):
+            continue
         data["request_id"] = doc.id
         requests.append(data)
     return {"requests": requests}
@@ -3811,7 +3846,13 @@ async def get_my_friends(authorization: Optional[str] = Header(default=None)):
     if not doc.exists:
         return {"friends": {}}
     data = doc.to_dict()
-    return {"friends": data.get("friends") or {}}
+    blocked = _blocked_uids_for(uid)
+    friends = {
+        friend_uid: meta
+        for friend_uid, meta in (data.get("friends") or {}).items()
+        if friend_uid not in blocked
+    }
+    return {"friends": friends}
 
 
 @app.get("/friends/list")
@@ -3828,8 +3869,11 @@ async def get_friends_list(authorization: Optional[str] = Header(default=None)):
 
     doc = firebase_db.collection(FRIENDS_COLLECTION).document(uid).get()
     friends_map = (doc.to_dict().get("friends") or {}) if doc.exists else {}
+    blocked = _blocked_uids_for(uid)
     result = []
     for friend_uid in friends_map:
+        if friend_uid in blocked:
+            continue
         try:
             user_record = firebase_auth.get_user(friend_uid)
             result.append({
@@ -3890,9 +3934,12 @@ async def friends_feed(authorization: Optional[str] = Header(default=None)):
     if not friend_doc.exists:
         return {"feed": [], "friends_count": 0}
     friends_map = friend_doc.to_dict().get("friends") or {}
-    friend_uids = list(friends_map.keys())
+    blocked = _blocked_uids_for(uid)
+    friend_uids = [u for u in friends_map.keys() if u not in blocked]
     if not friend_uids:
-        return {"feed": [], "friends_count": 0}
+        return {"feed": [], "friends_count": len(friends_map)}
+
+    hidden_ids = _hidden_content_ids_for(uid)
 
     feed: list[dict] = []
     seen_ids: set[str] = set()
@@ -3907,6 +3954,8 @@ async def friends_feed(authorization: Optional[str] = Header(default=None)):
                 continue
             seen_ids.add(doc.id)
             d = doc.to_dict()
+            if not _feed_item_visible(doc.id, d, blocked, hidden_ids):
+                continue
             d["event_id"] = doc.id
             d["feed_type"] = "created"
             feed.append(d)
@@ -3919,12 +3968,323 @@ async def friends_feed(authorization: Optional[str] = Header(default=None)):
                 continue
             seen_ids.add(doc.id)
             d = doc.to_dict()
+            if not _feed_item_visible(doc.id, d, blocked, hidden_ids):
+                continue
             d["event_id"] = doc.id
             d["feed_type"] = "invited"
             feed.append(d)
 
     feed.sort(key=lambda e: e.get("created_at", ""), reverse=True)
     return {"feed": feed[:50], "friends_count": len(friend_uids)}
+
+
+USER_BLOCKS_COLLECTION = "user_blocks"
+CONTENT_REPORTS_COLLECTION = "content_reports"
+
+# Word-ish patterns for abuse, threats, and sexual exploitation. Nightlife
+# vocabulary (alcohol, bars, clubs) is allowed — the app is rated for it.
+_OBJECTIONABLE_RE = re.compile(
+    r"n[i1]gg(?:er|a)|f[a@]ggot|\bkys\b|kill yourself|child porn|child sexual",
+    re.IGNORECASE,
+)
+
+
+def _text_is_objectionable(text: Optional[str]) -> bool:
+    if not text:
+        return False
+    return _OBJECTIONABLE_RE.search(text) is not None
+
+
+def _feed_item_visible(
+    doc_id: str,
+    data: dict,
+    blocked: Set[str],
+    hidden_ids: Set[str],
+) -> bool:
+    """Drop hidden, reported, blocked, or objectionable posts from a feed."""
+    if data.get("hidden") or doc_id in hidden_ids:
+        return False
+    creator = (data.get("created_by_uid") or "").strip()
+    if creator and creator in blocked:
+        return False
+    if (
+        _text_is_objectionable(data.get("name"))
+        or _text_is_objectionable(data.get("description"))
+        or _text_is_objectionable(data.get("created_by_name"))
+    ):
+        return False
+    return True
+
+
+def _notify_moderation(kind: str, **fields: object) -> None:
+    """Surface a report in server logs so it can be actioned within 24 hours."""
+    detail = " ".join(f"{key}={value}" for key, value in fields.items())
+    logger.warning("[moderation] %s %s — remove content and eject user within 24h", kind, detail)
+
+
+def _blocked_uids_for(uid: str) -> Set[str]:
+    if not firebase_db:
+        return set()
+    blocked: Set[str] = set()
+    try:
+        mine = firebase_db.collection(USER_BLOCKS_COLLECTION).document(uid).get()
+        if mine.exists:
+            blocked.update((mine.to_dict().get("blocked") or {}).keys())
+        reverse = firebase_db.collection(USER_BLOCKS_COLLECTION).document(
+            f"reverse_{uid}"
+        ).get()
+        if reverse.exists:
+            blocked.update((reverse.to_dict().get("blocked_by") or {}).keys())
+    except Exception as e:
+        print(f"block lookup failed: {e}")
+    return blocked
+
+
+def _hidden_content_ids_for(uid: str) -> Set[str]:
+    if not firebase_db:
+        return set()
+    hidden: Set[str] = set()
+    try:
+        docs = firebase_db.collection(CONTENT_REPORTS_COLLECTION).where(
+            "reporter_uid", "==", uid
+        ).stream()
+        for doc in docs:
+            cid = (doc.to_dict() or {}).get("content_id")
+            if cid:
+                hidden.add(cid)
+    except Exception as e:
+        print(f"hidden content lookup failed: {e}")
+    return hidden
+
+
+def _unfriend(uid_a: str, uid_b: str) -> None:
+    if not firebase_db:
+        return
+    for uid, other in ((uid_a, uid_b), (uid_b, uid_a)):
+        ref = firebase_db.collection(FRIENDS_COLLECTION).document(uid)
+        doc = ref.get()
+        if not doc.exists:
+            continue
+        friends_map = doc.to_dict().get("friends") or {}
+        if other in friends_map:
+            friends_map.pop(other, None)
+            ref.set({"friends": friends_map})
+
+
+class ReportContentRequest(BaseModel):
+    target_uid: str
+    reason: str
+    content_id: Optional[str] = None
+    content_type: str = "planned_event"
+
+
+class BlockUserRequest(BaseModel):
+    target_uid: str
+    content_id: Optional[str] = None
+    content_type: str = "planned_event"
+
+
+@app.post("/moderation/report")
+async def report_content(
+    req: ReportContentRequest,
+    authorization: Optional[str] = Header(default=None),
+):
+    """Flag user-generated content. Hidden from reporter immediately; reviewed in 24h."""
+    initialize_firebase_if_needed()
+    if firebase_db is None:
+        raise HTTPException(status_code=501, detail="Firebase not configured")
+    decoded = _verify_and_get_user(authorization)
+    reporter_uid = decoded.get("uid")
+    if not reporter_uid:
+        raise HTTPException(status_code=400, detail="UID not found in token")
+    now = datetime.utcnow().isoformat() + "Z"
+    ref = firebase_db.collection(CONTENT_REPORTS_COLLECTION).document()
+    ref.set({
+        "reporter_uid": reporter_uid,
+        "target_uid": (req.target_uid or "").strip(),
+        "content_id": (req.content_id or "").strip() or None,
+        "content_type": req.content_type,
+        "reason": (req.reason or "").strip()[:500],
+        "status": "open",
+        "created_at": now,
+    })
+    content_id = (req.content_id or "").strip()
+    _notify_moderation(
+        "REPORT",
+        reporter=reporter_uid,
+        target=req.target_uid,
+        content=content_id or None,
+        reason=(req.reason or "").strip()[:500],
+        report_id=ref.id,
+    )
+    return {"message": "Report received. Content is hidden from your feed."}
+
+
+@app.post("/moderation/block")
+async def block_user(
+    req: BlockUserRequest,
+    authorization: Optional[str] = Header(default=None),
+):
+    """Block a user: hide their content instantly and notify moderation."""
+    initialize_firebase_if_needed()
+    if firebase_db is None:
+        raise HTTPException(status_code=501, detail="Firebase not configured")
+    decoded = _verify_and_get_user(authorization)
+    blocker_uid = decoded.get("uid")
+    target_uid = (req.target_uid or "").strip()
+    if not blocker_uid or not target_uid or blocker_uid == target_uid:
+        raise HTTPException(status_code=400, detail="Invalid block target")
+    now = datetime.utcnow().isoformat() + "Z"
+    block_ref = firebase_db.collection(USER_BLOCKS_COLLECTION).document(blocker_uid)
+    doc = block_ref.get()
+    blocked_map = (doc.to_dict().get("blocked") or {}) if doc.exists else {}
+    blocked_map[target_uid] = {"blocked_at": now}
+    block_ref.set({"blocked": blocked_map})
+
+    reverse_ref = firebase_db.collection(USER_BLOCKS_COLLECTION).document(
+        f"reverse_{target_uid}"
+    )
+    reverse_doc = reverse_ref.get()
+    blocked_by = (reverse_doc.to_dict().get("blocked_by") or {}) if reverse_doc.exists else {}
+    blocked_by[blocker_uid] = {"blocked_at": now}
+    reverse_ref.set({"blocked_by": blocked_by})
+
+    _unfriend(blocker_uid, target_uid)
+    content_id = (req.content_id or "").strip()
+    report_ref = firebase_db.collection(CONTENT_REPORTS_COLLECTION).document()
+    report_ref.set({
+        "reporter_uid": blocker_uid,
+        "target_uid": target_uid,
+        "content_id": content_id or None,
+        "content_type": req.content_type,
+        "reason": "blocked_user",
+        "status": "open",
+        "created_at": now,
+    })
+    _notify_moderation(
+        "BLOCK",
+        blocker=blocker_uid,
+        target=target_uid,
+        content=content_id or None,
+        report_id=report_ref.id,
+    )
+    return {"message": "User blocked. Their posts are hidden from your feed."}
+
+
+def _hide_events_by_user(target_uid: str, now: str, reason: str) -> int:
+    hidden = 0
+    docs = firebase_db.collection(PLANNED_EVENTS_COLLECTION).where(
+        "created_by_uid", "==", target_uid
+    ).stream()
+    for doc in docs:
+        doc.reference.update({
+            "hidden": True,
+            "hidden_at": now,
+            "hidden_reason": reason,
+        })
+        hidden += 1
+    return hidden
+
+
+def _eject_user(target_uid: str, now: str, reason: str) -> dict:
+    """Remove the user's posts and disable their account (Guideline 1.2)."""
+    hidden = _hide_events_by_user(target_uid, now, reason)
+    disabled = False
+    try:
+        firebase_auth.update_user(target_uid, disabled=True)
+        firebase_auth.revoke_refresh_tokens(target_uid)
+        disabled = True
+    except Exception as e:
+        logger.warning("eject user %s failed: %s", target_uid, e)
+    return {"hidden_events": hidden, "account_disabled": disabled}
+
+
+class ResolveModerationReportRequest(BaseModel):
+    report_id: str
+    eject_user: bool = True
+
+
+@app.get("/moderation/admin/reports")
+async def list_moderation_reports(
+    status: str = "open",
+    x_admin_token: Optional[str] = Header(default=None),
+):
+    """List content reports so they can be actioned within 24 hours."""
+    initialize_firebase_if_needed()
+    if firebase_db is None:
+        raise HTTPException(status_code=501, detail="Firebase not configured")
+    _verify_admin_token(x_admin_token)
+    wanted = (status or "open").strip()
+    reports = []
+    for doc in firebase_db.collection(CONTENT_REPORTS_COLLECTION).where(
+        "status", "==", wanted
+    ).stream():
+        data = doc.to_dict() or {}
+        data["report_id"] = doc.id
+        reports.append(data)
+    reports.sort(key=lambda r: r.get("created_at") or "")
+    return {"reports": reports}
+
+
+@app.post("/moderation/admin/resolve")
+async def resolve_moderation_report(
+    req: ResolveModerationReportRequest,
+    x_admin_token: Optional[str] = Header(default=None),
+):
+    """Remove reported content and, by default, eject the user who posted it."""
+    initialize_firebase_if_needed()
+    if firebase_db is None:
+        raise HTTPException(status_code=501, detail="Firebase not configured")
+    _verify_admin_token(x_admin_token)
+    report_id = (req.report_id or "").strip()
+    if not report_id:
+        raise HTTPException(status_code=400, detail="report_id is required")
+    ref = firebase_db.collection(CONTENT_REPORTS_COLLECTION).document(report_id)
+    snap = ref.get()
+    if not snap.exists:
+        raise HTTPException(status_code=404, detail="Report not found")
+    data = snap.to_dict() or {}
+    target_uid = (data.get("target_uid") or "").strip()
+    content_id = (data.get("content_id") or "").strip()
+    now = datetime.utcnow().isoformat() + "Z"
+    if content_id:
+        event_ref = firebase_db.collection(PLANNED_EVENTS_COLLECTION).document(content_id)
+        if event_ref.get().exists:
+            event_ref.update({
+                "hidden": True,
+                "hidden_at": now,
+                "hidden_reason": "moderation",
+            })
+    eject_result = {"hidden_events": 0, "account_disabled": False}
+    if req.eject_user and target_uid:
+        eject_result = _eject_user(target_uid, now, "moderation")
+        for doc in firebase_db.collection(CONTENT_REPORTS_COLLECTION).where(
+            "target_uid", "==", target_uid
+        ).stream():
+            body = doc.to_dict() or {}
+            if body.get("status") == "open":
+                doc.reference.update({
+                    "status": "resolved",
+                    "resolved_at": now,
+                    "action": "removed_and_ejected",
+                })
+    else:
+        ref.update({
+            "status": "resolved",
+            "resolved_at": now,
+            "action": "removed",
+        })
+    _notify_moderation(
+        "RESOLVED",
+        report_id=report_id,
+        target=target_uid,
+        ejected=req.eject_user,
+    )
+    return {
+        "message": "Report resolved",
+        "target_uid": target_uid,
+        **eject_result,
+    }
 
 
 # ---------- Planned events (create from event/place/restaurant, invite friends) ----------
@@ -3959,6 +4319,15 @@ async def create_planned_event(
     created_by_name = (decoded.get("name") or decoded.get("email") or "Someone").strip()
     if not created_by_uid:
         raise HTTPException(status_code=400, detail="UID not found in token")
+    if (
+        _text_is_objectionable(req.name)
+        or _text_is_objectionable(req.description)
+        or _text_is_objectionable(req.venue_name)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="This text is not allowed under our community guidelines.",
+        )
 
     invited_uids = [u for u in (req.invited_uids or []) if u and u != created_by_uid]
     now = datetime.utcnow().isoformat() + "Z"
@@ -4014,6 +4383,8 @@ async def get_planned_events(authorization: Optional[str] = Header(default=None)
     if not uid:
         raise HTTPException(status_code=400, detail="UID not found in token")
 
+    blocked = _blocked_uids_for(uid)
+    hidden_ids = _hidden_content_ids_for(uid)
     created = firebase_db.collection(PLANNED_EVENTS_COLLECTION).where(
         "created_by_uid", "==", uid
     ).stream()
@@ -4026,6 +4397,8 @@ async def get_planned_events(authorization: Optional[str] = Header(default=None)
         if doc.id not in seen_ids:
             seen_ids.add(doc.id)
             d = doc.to_dict()
+            if not _feed_item_visible(doc.id, d, blocked, hidden_ids):
+                continue
             d["event_id"] = doc.id
             d["is_creator"] = True
             events.append(d)
@@ -4033,6 +4406,8 @@ async def get_planned_events(authorization: Optional[str] = Header(default=None)
         if doc.id not in seen_ids:
             seen_ids.add(doc.id)
             d = doc.to_dict()
+            if not _feed_item_visible(doc.id, d, blocked, hidden_ids):
+                continue
             d["event_id"] = doc.id
             d["is_creator"] = False
             events.append(d)
@@ -4057,6 +4432,8 @@ async def request_join_event(
     decoded = _verify_and_get_user(authorization)
     uid = decoded.get("uid")
     display_name = (decoded.get("name") or decoded.get("email") or "Someone").strip()
+    if _text_is_objectionable(display_name):
+        display_name = "Someone"
     if not uid:
         raise HTTPException(status_code=400, detail="UID not found in token")
 
@@ -4068,6 +4445,10 @@ async def request_join_event(
     creator_uid = data.get("created_by_uid")
     if uid == creator_uid:
         raise HTTPException(status_code=400, detail="You are the creator of this event")
+    if creator_uid and (
+        creator_uid in _blocked_uids_for(uid) or uid in _blocked_uids_for(creator_uid)
+    ):
+        raise HTTPException(status_code=403, detail="Cannot join this event")
 
     existing_requests = data.get("join_requests") or []
     if any(r.get("uid") == uid for r in existing_requests):
@@ -4599,6 +4980,9 @@ async def get_random_suggestion_get(latitude: float, longitude: float):
     return Suggestion(suggestion="Visit " + pick["name"])
 
 
+# `editorialSummary` is the only Atmosphere-tier field we ask for, and it moves
+# every search from the Enterprise SKU to the pricier Enterprise + Atmosphere
+# one. Keep the mask at Enterprise; `summary` falls back to None.
 _PLACES_FIELD_MASK = ",".join([
     "places.id",
     "places.displayName",
@@ -4608,25 +4992,104 @@ _PLACES_FIELD_MASK = ",".join([
     "places.photos",
     "places.primaryType",
     "places.types",
-    "places.editorialSummary",
     "places.priceLevel",
     "places.websiteUri",
     "places.googleMapsUri",
 ])
 
 
+# ---------------------------------------------------------------------------
+# Places photo URL cache
+# Photo media is billed per fetch, so handing the app a `.../media?key=...`
+# link re-bills on every image view. Resolve each photo resource once to the
+# durable googleusercontent CDN URL, which the client loads for free, and keep
+# it in-process so repeat picks of the same place cost nothing.
+# ---------------------------------------------------------------------------
+_PHOTO_URL_CACHE: dict[str, Tuple[float, Optional[str]]] = {}
+# photo resource name -> (expires_at_epoch, resolved_url_or_None)
+_PHOTO_URL_LOCK = threading.Lock()
+_PHOTO_URL_TTL_SEC = 3 * 60 * 60  # 3 hours
+_PHOTO_URL_MAX_ENTRIES = 2048
+
+
+def _resolve_place_photo_url(photo_ref: str) -> Optional[str]:
+    """Resolve a Places photo resource to a durable CDN URL (cached)."""
+    if not photo_ref or not GOOGLE_PLACES_ENABLED:
+        return None
+
+    now = time.time()
+    with _PHOTO_URL_LOCK:
+        entry = _PHOTO_URL_CACHE.get(photo_ref)
+        if entry is not None:
+            expires_at, cached_url = entry
+            if expires_at > now:
+                return cached_url
+            _PHOTO_URL_CACHE.pop(photo_ref, None)
+
+    resolved: Optional[str] = None
+    try:
+        resp = requests.get(
+            f"https://places.googleapis.com/v1/{photo_ref}/media"
+            f"?maxWidthPx=800&skipHttpRedirect=true",
+            headers={"X-Goog-Api-Key": api_key},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            uri = (resp.json() or {}).get("photoUri")
+            if isinstance(uri, str) and uri.startswith("http"):
+                resolved = uri
+        else:
+            print(
+                f"[places] photo resolve got {resp.status_code} for {photo_ref}"
+            )
+    except Exception as e:
+        print(f"[places] photo resolve failed: {e}")
+
+    # Failures are cached too, so a broken resource does not retry per request.
+    with _PHOTO_URL_LOCK:
+        if len(_PHOTO_URL_CACHE) >= _PHOTO_URL_MAX_ENTRIES:
+            for k in [k for k, (exp, _) in _PHOTO_URL_CACHE.items() if exp <= now]:
+                _PHOTO_URL_CACHE.pop(k, None)
+            while len(_PHOTO_URL_CACHE) >= _PHOTO_URL_MAX_ENTRIES:
+                _PHOTO_URL_CACHE.pop(next(iter(_PHOTO_URL_CACHE)))
+        _PHOTO_URL_CACHE[photo_ref] = (now + _PHOTO_URL_TTL_SEC, resolved)
+
+    return resolved
+
+
+def _attach_photo_url(place: dict) -> dict:
+    """Return a copy of `place` with `photo_url` resolved for the client."""
+    if not place:
+        return place
+    out = dict(place)
+    photo_ref = out.pop("photo_ref", "") or ""
+    if not out.get("photo_url") and photo_ref:
+        out["photo_url"] = _resolve_place_photo_url(photo_ref)
+    return out
+
+
+def _attach_photo_urls(places: List[dict]) -> List[dict]:
+    """Resolve photo URLs for a list of places about to be returned."""
+    if not places:
+        return []
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=min(8, len(places))) as pool:
+        return list(pool.map(_attach_photo_url, places))
+
+
 def _normalize_place_result(place: dict) -> dict:
-    """Convert a Places API place resource into our suggestion dict."""
+    """Convert a Places API place resource into our suggestion dict.
+
+    Only the photo *resource name* is kept here. A search pool can hold several
+    hundred places and resolving a photo is a billed request, so `photo_url` is
+    filled in by `_attach_photo_url` for the places we actually return.
+    """
     name = place.get("displayName", {}).get("text", "Unknown")
-    photo_url = None
+    photo_ref = ""
     photos = place.get("photos", [])
     if photos:
-        photo_ref = photos[0].get("name", "")
-        if photo_ref:
-            photo_url = (
-                f"https://places.googleapis.com/v1/{photo_ref}/media"
-                f"?maxWidthPx=800&key={api_key}"
-            )
+        photo_ref = photos[0].get("name", "") or ""
     price_str = place.get("priceLevel")
     price_int = {
         "PRICE_LEVEL_FREE": 0,
@@ -4642,7 +5105,8 @@ def _normalize_place_result(place: dict) -> dict:
         "address": place.get("formattedAddress"),
         "rating": place.get("rating"),
         "user_rating_count": place.get("userRatingCount"),
-        "photo_url": photo_url,
+        "photo_ref": photo_ref,
+        "photo_url": None,
         "type": place.get("primaryType"),
         "types": place.get("types") or [],
         "summary": place.get("editorialSummary", {}).get("text"),
@@ -4652,11 +5116,76 @@ def _normalize_place_result(place: dict) -> dict:
     }
 
 
+_STATIC_PLACES: Optional[List[dict]] = None
+_STATIC_PLACES_LOCK = threading.Lock()
+
+
+def _load_static_places() -> List[dict]:
+    """Static places served to every user while Google Places is disabled."""
+    global _STATIC_PLACES
+    with _STATIC_PLACES_LOCK:
+        if _STATIC_PLACES is None:
+            try:
+                with open(STATIC_PLACES_PATH, "r", encoding="utf-8") as f:
+                    raw = json.load(f)
+            except Exception as e:
+                print(f"[places:static] failed to load {STATIC_PLACES_PATH}: {e}")
+                raw = []
+            places: List[dict] = []
+            for p in raw if isinstance(raw, list) else []:
+                if not isinstance(p, dict) or not p.get("name"):
+                    continue
+                name = p["name"]
+                address = p.get("address")
+                maps_query = requests.utils.quote(f"{name} {address or ''}".strip())
+                places.append({
+                    "place_id": p.get("place_id") or f"static:{name}",
+                    "name": name,
+                    "address": address,
+                    "rating": p.get("rating"),
+                    "user_rating_count": p.get("user_rating_count"),
+                    "photo_ref": "",
+                    "photo_url": p.get("photo_url"),
+                    "type": p.get("type"),
+                    "types": p.get("types") or ([p["type"]] if p.get("type") else []),
+                    "summary": p.get("summary"),
+                    "price_level": p.get("price_level"),
+                    "website_url": p.get("website_url"),
+                    "google_maps_url": p.get("google_maps_url")
+                    or f"https://www.google.com/maps/search/?api=1&query={maps_query}",
+                })
+            _STATIC_PLACES = places
+            print(f"[places:static] loaded {len(places)} places from {STATIC_PLACES_PATH}")
+        return [dict(p) for p in _STATIC_PLACES]
+
+
+def _static_nearby_places(included_types: List[str] | None) -> List[dict]:
+    wanted = {t.lower() for t in (included_types or places_of_interest)}
+    return [p for p in _load_static_places() if _place_type_set(p) & wanted][:20]
+
+
+def _static_text_places(query: str, max_results: int) -> List[dict]:
+    """Match when every query word appears in the name, summary, or types."""
+    words = [w for w in query.lower().split() if w]
+    matches: List[dict] = []
+    for p in _load_static_places():
+        haystack = " ".join([
+            p.get("name") or "",
+            p.get("summary") or "",
+            " ".join(t.replace("_", " ") for t in _place_type_set(p)),
+        ]).lower()
+        if all(w in haystack for w in words):
+            matches.append(p)
+    return matches[:max_results]
+
+
 def search_nearby_places(
     location: LocationData,
     radius: float = 10000.0,
     included_types: List[str] | None = None,
 ) -> List[dict]:
+    if not GOOGLE_PLACES_ENABLED:
+        return _static_nearby_places(included_types)
     endpoint_url = "https://places.googleapis.com/v1/places:searchNearby"
     headers = {
         "Content-Type": "application/json",
@@ -4694,6 +5223,8 @@ def search_text_places(
     """Places Text Search (New) — complementary to searchNearby for dietary queries."""
     if not query or not query.strip():
         return []
+    if not GOOGLE_PLACES_ENABLED:
+        return _static_text_places(query, min(max(max_results, 1), 20))
     endpoint_url = "https://places.googleapis.com/v1/places:searchText"
     headers = {
         "Content-Type": "application/json",

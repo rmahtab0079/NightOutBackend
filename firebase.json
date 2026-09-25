@@ -32,6 +32,22 @@
       {
         "source": "/support",
         "destination": "/support/index.html"
+      },
+      {
+        "source": "/deleteaccount",
+        "destination": "/deleteaccount/index.html"
+      },
+      {
+        "source": "/deleteuser",
+        "destination": "/deleteuser/index.html"
+      },
+      {
+        "source": "/terms",
+        "destination": "/terms/index.html"
+      },
+      {
+        "source": "/community",
+        "destination": "/community/index.html"
       }
     ]
   }

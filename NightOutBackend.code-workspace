@@ -4,7 +4,7 @@
 			"path": "."
 		},
 		{
-			"path": "../NightOutClient"
+			"path": "../../Documents/NightOutClient"
 		}
 	],
 	"settings": {}

@@ -61,5 +61,11 @@ service cloud.firestore {
         allow write: if false;
       }
     }
+    match /user_blocks/{uid} {
+      allow read, write: if false;
+    }
+    match /content_reports/{id} {
+      allow read, write: if false;
+    }
   }
 }
